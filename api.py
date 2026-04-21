@@ -12,6 +12,7 @@ from werkzeug.utils import secure_filename
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from src.pdf_processor import PDFProcessor
+from src.quickstart import parse_pdf, extract_questions
 
 
 app = Flask(__name__)
@@ -23,6 +24,13 @@ MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
+
+
+_ILLEGAL_EXCEL_CHARS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f￾￿]')
+
+def _sanitize(text: str) -> str:
+    """Remove characters that Excel/openpyxl cannot store in a cell."""
+    return _ILLEGAL_EXCEL_CHARS.sub('', text) if text else text
 
 
 def allowed_file(filename):
@@ -76,66 +84,88 @@ def extract_qa():
              -F "answers_pdf=@answers.pdf" \\
              http://localhost:5000/api/extract -o output.xlsx
     """
+    questions_path = None
+    answers_path = None
     try:
-        # Validate request
         is_valid, error_msg = validate_request()
         if not is_valid:
             return jsonify({"error": error_msg}), 400
-        
-        # Get uploaded files
+
         questions_file = request.files['questions_pdf']
         answers_file = request.files['answers_pdf']
-        
-        # Save temporarily
-        questions_path = os.path.join(
-            app.config['UPLOAD_FOLDER'],
-            secure_filename(questions_file.filename)
-        )
-        answers_path = os.path.join(
-            app.config['UPLOAD_FOLDER'],
-            secure_filename(answers_file.filename)
-        )
-        
+
+        questions_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(questions_file.filename))
+        answers_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(answers_file.filename))
+
         questions_file.save(questions_path)
         answers_file.save(answers_path)
-        
-        # Process PDFs
+
+        # Parse questions PDF with LandingAI, extract answers PDF with PDFProcessor
+        questions_md = parse_pdf(questions_path)["markdown"]
+        questions_list = extract_questions(questions_md)
+
         processor = PDFProcessor(questions_path, answers_path)
-        
-        # Create output Excel file
-        output_excel = os.path.join(
-            app.config['UPLOAD_FOLDER'],
-            'extracted_qa.xlsx'
-        )
-        
-        processor.process_and_export(output_excel)
-        
-        # Get summary
-        summary = processor.get_summary()
-        
-        # Send file as response
+        answers_text = processor.extract_text_from_pdf(answers_path)
+        answers_list = processor.parse_answers(answers_text)
+
+        if not questions_list:
+            return jsonify({"error": "No questions could be extracted from the PDF"}), 422
+
+        # Deduplicate — keep first occurrence of each unique question
+        seen = set()
+        unique_pairs = []
+        for i, q in enumerate(questions_list):
+            key = q.strip().lower()
+            if key not in seen:
+                seen.add(key)
+                answer = answers_list[i] if i < len(answers_list) else "N/A"
+                unique_pairs.append((q, answer))
+
+        # Build Excel output
+        output_excel = os.path.join(app.config['UPLOAD_FOLDER'], 'extracted_qa.xlsx')
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Q&A"
+
+        ws.append(["Question #", "Question", "Correct Answer"])
+        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+        header_font = Font(color="FFFFFF", bold=True)
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        for idx, (question, answer) in enumerate(unique_pairs, start=1):
+            ws.append([idx, _sanitize(question), _sanitize(answer)])
+            ws.cell(idx + 1, 1).alignment = Alignment(horizontal="center", vertical="top")
+            ws.cell(idx + 1, 2).alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+            ws.cell(idx + 1, 3).alignment = Alignment(horizontal="center", vertical="center")
+
+        ws.column_dimensions['A'].width = 12
+        ws.column_dimensions['B'].width = 60
+        ws.column_dimensions['C'].width = 18
+        wb.save(output_excel)
+
         return send_file(
             output_excel,
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             as_attachment=True,
-            download_name=f'qa_extract_{summary["total_questions"]}q.xlsx'
+            download_name=f'qa_extract_{len(unique_pairs)}q.xlsx'
         )
-        
+
     except FileNotFoundError as e:
         return jsonify({"error": f"File not found: {str(e)}"}), 404
-    
+
     except Exception as e:
         return jsonify({"error": f"Processing error: {str(e)}"}), 500
-    
+
     finally:
-        # Cleanup temporary files
-        try:
-            if os.path.exists(questions_path):
-                os.remove(questions_path)
-            if os.path.exists(answers_path):
-                os.remove(answers_path)
-        except:
-            pass
+        for path in (questions_path, answers_path):
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
 
 
 @app.route('/api/extract-json', methods=['POST'])
@@ -462,7 +492,7 @@ def _build_evaluation_excel(
     for idx, (question, answer, api_resp, status) in enumerate(
         zip(questions, answers, api_responses, statuses), start=1
     ):
-        ws.append([idx, question, answer, api_resp, status])
+        ws.append([idx, _sanitize(question), _sanitize(answer), _sanitize(api_resp), status])
         row = ws.max_row
         # Style question and API response cells
         ws.cell(row, 1).alignment = Alignment(horizontal="center", vertical="top")
