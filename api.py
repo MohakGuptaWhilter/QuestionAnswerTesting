@@ -12,7 +12,7 @@ from werkzeug.utils import secure_filename
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from src.pdf_processor import PDFProcessor
-from src.quickstart import parse_pdf, extract_questions
+from src.quickstart import parse_pdf
 
 
 app = Flask(__name__)
@@ -100,11 +100,10 @@ def extract_qa():
         questions_file.save(questions_path)
         answers_file.save(answers_path)
 
-        # Parse questions PDF with LandingAI, extract answers PDF with PDFProcessor
+        # Parse questions PDF with LandingAI, then use PDFProcessor (regex) for both lists
         questions_md = parse_pdf(questions_path)["markdown"]
-        questions_list = extract_questions(questions_md)
-
         processor = PDFProcessor(questions_path, answers_path)
+        questions_list = processor.parse_questions(questions_md)
         answers_text = processor.extract_text_from_pdf(answers_path)
         answers_list = processor.parse_answers(answers_text)
 
@@ -689,6 +688,81 @@ def evaluate_from_excel():
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             as_attachment=True,
             download_name=f'evaluation_{total}q.xlsx'
+        )
+
+    except Exception as e:
+        return jsonify({"error": f"Processing error: {str(e)}"}), 500
+
+    finally:
+        try:
+            if excel_path and os.path.exists(excel_path):
+                os.remove(excel_path)
+        except Exception:
+            pass
+
+
+_NOISE_PATTERNS = [
+    re.compile(r'<a\s[^>]*>.*?</a>', re.IGNORECASE | re.DOTALL),  # <a id='...'></a>
+    re.compile(r'<!--.*?-->', re.DOTALL),                           # <!-- PAGE BREAK -->
+    re.compile(r'Text\s*&\s*Video Solutions.*', re.IGNORECASE),
+    re.compile(r'Download MARKS App.*', re.IGNORECASE),
+    re.compile(r'https?://\S+'),                                    # bare URLs
+    re.compile(r'Mathematics Top \d+ PYQs.*', re.IGNORECASE),
+    re.compile(r'^MathonGo\s*$', re.IGNORECASE | re.MULTILINE),
+]
+
+
+def _clean_question(text: str) -> str:
+    for pattern in _NOISE_PATTERNS:
+        text = pattern.sub('', text)
+    # collapse runs of blank lines down to one
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+@app.route('/api/clean-excel', methods=['POST'])
+def clean_excel():
+    """
+    Accept an Excel file produced by /api/extract, strip noise from the
+    Question column (col B), and return the cleaned file.
+
+    Form fields:
+        qa_excel  (file, required) — .xlsx with at least a Question column (col B)
+
+    Example cURL:
+        curl -F "qa_excel=@extracted_qa.xlsx" \\
+             http://localhost:5000/api/clean-excel -o cleaned.xlsx
+    """
+    excel_path = None
+    try:
+        if 'qa_excel' not in request.files:
+            return jsonify({"error": "Missing required file: 'qa_excel'"}), 400
+
+        excel_file = request.files['qa_excel']
+        if excel_file.filename == '':
+            return jsonify({"error": "File name cannot be empty"}), 400
+        if not excel_file.filename.lower().endswith(('.xlsx', '.xls')):
+            return jsonify({"error": "Only Excel files (.xlsx) are accepted"}), 400
+
+        excel_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(excel_file.filename))
+        excel_file.save(excel_path)
+
+        wb = load_workbook(excel_path)
+        ws = wb.active
+
+        for row in ws.iter_rows(min_row=2):
+            cell = row[1]   # column B — Question
+            if cell.value:
+                cell.value = _sanitize(_clean_question(str(cell.value)))
+
+        output_path = os.path.join(app.config['UPLOAD_FOLDER'], 'cleaned_qa.xlsx')
+        wb.save(output_path)
+
+        return send_file(
+            output_path,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name='cleaned_qa.xlsx'
         )
 
     except Exception as e:

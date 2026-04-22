@@ -2,7 +2,7 @@ import React, { useState, useRef } from 'react';
 import './PDFUploader.css';
 
 const PDFUploader = () => {
-  // 'extract' | 'evaluate' | 'evaluate-excel'
+  // 'extract' | 'evaluate' | 'evaluate-excel' | 'clean-excel'
   const [mode, setMode] = useState('extract');
   const [questionsPdf, setQuestionsPdf] = useState(null);
   const [answersPdf, setAnswersPdf] = useState(null);
@@ -114,6 +114,18 @@ const PDFUploader = () => {
     triggerDownload(await res.blob(), 'evaluation_results.xlsx');
   };
 
+  const handleCleanExcel = async () => {
+    const fd = new FormData();
+    fd.append('qa_excel', qaExcel);
+
+    const res = await fetch('/api/clean-excel', { method: 'POST', body: fd });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `Server error ${res.status}`);
+    }
+    triggerDownload(await res.blob(), 'cleaned_qa.xlsx');
+  };
+
   const handleEvaluateExcel = async () => {
     const fd = new FormData();
     fd.append('qa_excel', qaExcel);
@@ -139,7 +151,7 @@ const PDFUploader = () => {
       setError('Please select both PDF files.');
       return;
     }
-    if (mode === 'evaluate-excel' && !qaExcel) {
+    if ((mode === 'evaluate-excel' || mode === 'clean-excel') && !qaExcel) {
       setError('Please select an Excel file.');
       return;
     }
@@ -152,7 +164,8 @@ const PDFUploader = () => {
     try {
       if (mode === 'extract') await handleExtract();
       else if (mode === 'evaluate') await handleEvaluate();
-      else await handleEvaluateExcel();
+      else if (mode === 'evaluate-excel') await handleEvaluateExcel();
+      else await handleCleanExcel();
       setSuccess(true);
       resetInputs();
     } catch (err) {
@@ -167,6 +180,8 @@ const PDFUploader = () => {
       ? questionsPdf && answersPdf
       : mode === 'evaluate'
       ? questionsPdf && answersPdf && agentId.trim() && deploymentSlug.trim()
+      : mode === 'clean-excel'
+      ? !!qaExcel
       : qaExcel && agentId.trim() && deploymentSlug.trim();
 
   const isEvaluateMode = mode === 'evaluate' || mode === 'evaluate-excel';
@@ -177,12 +192,14 @@ const PDFUploader = () => {
     extract: 'Extract Q&A to Excel',
     evaluate: 'Evaluate via AI (PDFs)',
     'evaluate-excel': 'Evaluate via AI (Excel)',
+    'clean-excel': 'Clean Questions in Excel',
   };
 
   const buttonLabels = {
     extract: { idle: 'Extract & Download Excel', busy: 'Processing...' },
     evaluate: { idle: 'Evaluate & Download Results', busy: 'Evaluating… this may take a while' },
     'evaluate-excel': { idle: 'Evaluate & Download Results', busy: 'Evaluating… this may take a while' },
+    'clean-excel': { idle: 'Clean & Download Excel', busy: 'Cleaning...' },
   };
 
   return (
@@ -213,6 +230,14 @@ const PDFUploader = () => {
         >
           Evaluate (Excel)
         </button>
+        <button
+          type="button"
+          className={`mode-tab ${mode === 'clean-excel' ? 'active' : ''}`}
+          onClick={() => handleModeChange('clean-excel')}
+          disabled={loading}
+        >
+          Clean Excel
+        </button>
       </div>
 
       <form onSubmit={handleSubmit} className="upload-form">
@@ -231,6 +256,14 @@ const PDFUploader = () => {
             Upload the Excel file produced by <strong>Extract Q&amp;A</strong>. Each
             question will be sent to the knowledge base API and the response
             compared against the correct answer already in the file.
+          </div>
+        )}
+        {mode === 'clean-excel' && (
+          <div className="evaluate-info">
+            Upload an Excel file produced by <strong>Extract Q&amp;A</strong>. Noise
+            such as anchor tags, marketing text, and page-break markers will be
+            stripped from the <strong>Question</strong> column. All other columns
+            are left untouched.
           </div>
         )}
 
@@ -275,8 +308,8 @@ const PDFUploader = () => {
           </>
         )}
 
-        {/* Excel input (evaluate-excel mode) */}
-        {mode === 'evaluate-excel' && (
+        {/* Excel input (evaluate-excel + clean-excel modes) */}
+        {(mode === 'evaluate-excel' || mode === 'clean-excel') && (
           <div className="file-input-group">
             <label htmlFor="qaExcel">Q&amp;A Excel file *</label>
             <input
@@ -334,6 +367,8 @@ const PDFUploader = () => {
           <div className="success-message">
             {mode === 'extract'
               ? `Successfully extracted ${apiResponse?.summary?.total_questions} questions. Excel downloaded.`
+              : mode === 'clean-excel'
+              ? 'Questions cleaned. Cleaned Excel downloaded.'
               : 'Evaluation complete. Results Excel downloaded.'}
           </div>
         )}
