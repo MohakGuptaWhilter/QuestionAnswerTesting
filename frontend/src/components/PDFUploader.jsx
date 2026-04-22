@@ -12,7 +12,6 @@ const PDFUploader = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [success, setSuccess] = useState(false);
-  const [apiResponse, setApiResponse] = useState(null);
 
   const questionsInputRef = useRef(null);
   const answersInputRef = useRef(null);
@@ -22,7 +21,6 @@ const PDFUploader = () => {
     setMode(newMode);
     setError(null);
     setSuccess(false);
-    setApiResponse(null);
   };
 
   const handlePdfChange = (e, setter, label) => {
@@ -82,21 +80,12 @@ const PDFUploader = () => {
     fd.append('questions_pdf', questionsPdf);
     fd.append('answers_pdf', answersPdf);
 
-    const jsonRes = await fetch('/api/extract-json', { method: 'POST', body: fd });
-    if (!jsonRes.ok) {
-      const err = await jsonRes.json();
+    const res = await fetch('/api/extract', { method: 'POST', body: fd });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
       throw new Error(err.error || 'Failed to extract Q&A');
     }
-    const jsonData = await jsonRes.json();
-    if (jsonData.status !== 'success') throw new Error(jsonData.error || 'Unknown error');
-    setApiResponse(jsonData);
-
-    const fd2 = new FormData();
-    fd2.append('questions_pdf', questionsPdf);
-    fd2.append('answers_pdf', answersPdf);
-    const excelRes = await fetch('/api/extract', { method: 'POST', body: fd2 });
-    if (!excelRes.ok) throw new Error('Failed to download Excel file');
-    triggerDownload(await excelRes.blob(), `qa_extract_${jsonData.summary.total_questions}q.xlsx`);
+    triggerDownload(await res.blob(), 'qa_extract.xlsx');
   };
 
   const handleEvaluate = async () => {
@@ -159,7 +148,6 @@ const PDFUploader = () => {
     setLoading(true);
     setError(null);
     setSuccess(false);
-    setApiResponse(null);
 
     try {
       if (mode === 'extract') await handleExtract();
@@ -366,7 +354,7 @@ const PDFUploader = () => {
         {success && (
           <div className="success-message">
             {mode === 'extract'
-              ? `Successfully extracted ${apiResponse?.summary?.total_questions} questions. Excel downloaded.`
+              ? 'Successfully extracted Q&A. Excel downloaded.'
               : mode === 'clean-excel'
               ? 'Questions cleaned. Cleaned Excel downloaded.'
               : 'Evaluation complete. Results Excel downloaded.'}
@@ -382,29 +370,6 @@ const PDFUploader = () => {
         </button>
       </form>
 
-      {/* Preview panel (extract mode only) */}
-      {apiResponse && mode === 'extract' && (
-        <div className="preview-container">
-          <h3>Preview ({apiResponse.data.length} questions)</h3>
-          <div className="questions-preview">
-            {apiResponse.data.slice(0, 5).map((item) => (
-              <div key={item.id} className="question-item">
-                <strong>Q{item.id}:</strong>{' '}
-                {item.question.length > 100
-                  ? item.question.substring(0, 100) + '…'
-                  : item.question}
-                <br />
-                <em className="answer-badge">Answer: {item.correct_answer}</em>
-              </div>
-            ))}
-            {apiResponse.data.length > 5 && (
-              <div className="more-items">
-                + {apiResponse.data.length - 5} more questions
-              </div>
-            )}
-          </div>
-        </div>
-      )}
     </div>
   );
 };
