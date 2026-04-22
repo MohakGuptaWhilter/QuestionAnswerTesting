@@ -111,16 +111,6 @@ def extract_qa():
         if not questions_list:
             return jsonify({"error": "No questions could be extracted from the PDF"}), 422
 
-        # Deduplicate — keep first occurrence of each unique question
-        seen = set()
-        unique_pairs = []
-        for i, q in enumerate(questions_list):
-            key = q.strip().lower()
-            if key not in seen:
-                seen.add(key)
-                answer = answers_list[i] if i < len(answers_list) else "N/A"
-                unique_pairs.append((q, answer))
-
         # Build Excel output
         output_excel = os.path.join(app.config['UPLOAD_FOLDER'], 'extracted_qa.xlsx')
         wb = Workbook()
@@ -135,7 +125,8 @@ def extract_qa():
             cell.font = header_font
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-        for idx, (question, answer) in enumerate(unique_pairs, start=1):
+        for idx, question in enumerate(questions_list, start=1):
+            answer = answers_list[idx - 1] if idx - 1 < len(answers_list) else "N/A"
             ws.append([idx, _sanitize(question), _sanitize(answer)])
             ws.cell(idx + 1, 1).alignment = Alignment(horizontal="center", vertical="top")
             ws.cell(idx + 1, 2).alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
@@ -150,7 +141,7 @@ def extract_qa():
             output_excel,
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             as_attachment=True,
-            download_name=f'qa_extract_{len(unique_pairs)}q.xlsx'
+            download_name=f'qa_extract_{len(questions_list)}q.xlsx'
         )
 
     except FileNotFoundError as e:
