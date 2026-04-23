@@ -1,0 +1,16 @@
+.agent-config {
+  /* Container for agent ID and deployment slug inputs */
+  padding: 15px;
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  margin-bottom: 15px;
+}
+
+.agent-config .file-input-group {
+  margin-bottom: 15px;
+}
+
+.agent-config .file-input-group:last-child {
+  margin-bottom: 0;
+}

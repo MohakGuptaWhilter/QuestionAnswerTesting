@@ -1,0 +1,128 @@
+.file-input-group {
+  margin-bottom: 20px;
+}
+
+.file-input-group label {
+  display: block;
+  margin-bottom: 8px;
+  font-weight: 600;
+  color: #333;
+  font-size: 14px;
+}
+
+.file-input {
+  width: 100%;
+  padding: 10px;
+  border: 2px dashed #3b82f6;
+  border-radius: 8px;
+  cursor: pointer;
+  background-color: #f0f7ff;
+  transition: all 0.3s ease;
+  font-size: 14px;
+}
+
+.file-input:hover:not(:disabled) {
+  border-color: #2563eb;
+  background-color: #e0f2fe;
+}
+
+.file-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.file-info {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: #ecfdf5;
+  border-left: 4px solid #10b981;
+  color: #059669;
+  font-size: 13px;
+  border-radius: 4px;
+}
+
+.text-input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 2px solid #e5e7eb;
+  border-radius: 8px;
+  font-size: 14px;
+  transition: border-color 0.2s ease;
+  color: #333;
+  background: #fafafa;
+}
+
+.text-input:focus {
+  outline: none;
+  border-color: #3b82f6;
+  background: white;
+}
+
+.text-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.error-message {
+  padding: 12px 15px;
+  background: #fee2e2;
+  border-left: 4px solid #ef4444;
+  color: #dc2626;
+  border-radius: 4px;
+  margin-bottom: 15px;
+  font-size: 14px;
+}
+
+.success-message {
+  padding: 12px 15px;
+  background: #dcfce7;
+  border-left: 4px solid #22c55e;
+  color: #166534;
+  border-radius: 4px;
+  margin-bottom: 15px;
+  font-size: 14px;
+}
+
+.submit-button {
+  width: 100%;
+  padding: 12px;
+  background: #3b82f6;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  margin-top: 10px;
+}
+
+.submit-button:hover:not(:disabled) {
+  background: #2563eb;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+}
+
+.submit-button:disabled {
+  background: #cbd5e1;
+  cursor: not-allowed;
+}
+
+/* Button variants */
+.submit-button.evaluate {
+  background: #7c3aed;
+}
+
+.submit-button.evaluate:hover:not(:disabled) {
+  background: #6d28d9;
+  box-shadow: 0 4px 12px rgba(124, 58, 237, 0.3);
+}
+
+.submit-button.gpt {
+  background: #d97706;
+}
+
+.submit-button.gpt:hover:not(:disabled) {
+  background: #b45309;
+  box-shadow: 0 4px 12px rgba(217, 119, 6, 0.3);
+}

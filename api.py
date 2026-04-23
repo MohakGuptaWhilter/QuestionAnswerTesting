@@ -10,6 +10,7 @@ from src.helpers import (
     sanitize, clean_question,
     call_search_api, check_correctness, build_evaluation_excel,
 )
+from src.gpt_processor import extract_qa_with_gpt
 
 app = Flask(__name__)
 
@@ -286,6 +287,77 @@ def clean_excel():
         try:
             if excel_path and os.path.exists(excel_path):
                 os.remove(excel_path)
+        except Exception:
+            pass
+
+
+@app.route('/api/extract-gpt', methods=['POST'])
+def extract_gpt():
+    pdf_path = None
+    try:
+        if 'pdf' not in request.files:
+            return jsonify({"error": "Missing required file: 'pdf'"}), 400
+
+        pdf_file = request.files['pdf']
+        if pdf_file.filename == '':
+            return jsonify({"error": "File name cannot be empty"}), 400
+        if not allowed_file(pdf_file.filename):
+            return jsonify({"error": "Only PDF files are allowed"}), 400
+
+        model = request.form.get("model", "gpt-4o-mini")
+
+        pdf_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(pdf_file.filename))
+        pdf_file.save(pdf_path)
+
+        pairs = extract_qa_with_gpt(pdf_path, model=model)
+
+        if not pairs:
+            return jsonify({"error": "No question-answer pairs found in the PDF."}), 422
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Q&A"
+
+        ws.append(["Question #", "Question", "Answer / Solution"])
+        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+        header_font = Font(color="FFFFFF", bold=True)
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        for idx, pair in enumerate(pairs, start=1):
+            ws.append([idx, sanitize(pair["question"]), sanitize(pair["answer"])])
+            ws.cell(idx + 1, 1).alignment = Alignment(horizontal="center", vertical="top")
+            ws.cell(idx + 1, 2).alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+            ws.cell(idx + 1, 3).alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+        ws.column_dimensions['A'].width = 12
+        ws.column_dimensions['B'].width = 60
+        ws.column_dimensions['C'].width = 70
+
+        output_excel = os.path.join(app.config['UPLOAD_FOLDER'], 'gpt_qa.xlsx')
+        wb.save(output_excel)
+
+        return send_file(
+            output_excel,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=f'gpt_qa_{len(pairs)}q.xlsx',
+        )
+
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 500
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 404
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": f"Processing error: {str(e)}"}), 500
+    finally:
+        try:
+            if pdf_path and os.path.exists(pdf_path):
+                os.remove(pdf_path)
         except Exception:
             pass
 

@@ -1,27 +1,34 @@
-import React, { useState, useRef } from 'react';
+import React, { useState } from 'react';
+import ModeSelector from './common/ModeSelector';
+import GptExtractor from './modes/GptExtractor';
+import PdfExtractor from './modes/PdfExtractor';
+import PdfEvaluator from './modes/PdfEvaluator';
+import ExcelProcessor from './modes/ExcelProcessor';
 import './PDFUploader.css';
 
 const PDFUploader = () => {
-  // 'extract' | 'evaluate' | 'evaluate-excel' | 'clean-excel'
+  // State management
   const [mode, setMode] = useState('extract');
   const [questionsPdf, setQuestionsPdf] = useState(null);
   const [answersPdf, setAnswersPdf] = useState(null);
+  const [singlePdf, setSinglePdf] = useState(null);
   const [qaExcel, setQaExcel] = useState(null);
   const [agentId, setAgentId] = useState('');
   const [deploymentSlug, setDeploymentSlug] = useState('');
+  const [gptModel, setGptModel] = useState('gpt-4o-mini');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [success, setSuccess] = useState(false);
 
-  const questionsInputRef = useRef(null);
-  const answersInputRef = useRef(null);
-  const excelInputRef = useRef(null);
+  // ── Mode change handler ────────────────────────────────────────────────────
 
   const handleModeChange = (newMode) => {
     setMode(newMode);
     setError(null);
     setSuccess(false);
   };
+
+  // ── File handlers ──────────────────────────────────────────────────────────
 
   const handlePdfChange = (e, setter, label) => {
     const file = e.target.files[0];
@@ -56,10 +63,8 @@ const PDFUploader = () => {
   const resetInputs = () => {
     setQuestionsPdf(null);
     setAnswersPdf(null);
+    setSinglePdf(null);
     setQaExcel(null);
-    if (questionsInputRef.current) questionsInputRef.current.value = '';
-    if (answersInputRef.current) answersInputRef.current.value = '';
-    if (excelInputRef.current) excelInputRef.current.value = '';
   };
 
   const triggerDownload = (blob, filename) => {
@@ -73,7 +78,20 @@ const PDFUploader = () => {
     document.body.removeChild(a);
   };
 
-  // ── mode handlers ──────────────────────────────────────────────────────────
+  // ── API handlers (mode-specific logic) ─────────────────────────────────────
+
+  const handleExtractGpt = async () => {
+    const fd = new FormData();
+    fd.append('pdf', singlePdf);
+    fd.append('model', gptModel);
+
+    const res = await fetch('/api/extract-gpt', { method: 'POST', body: fd });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to extract Q&A with GPT');
+    }
+    triggerDownload(await res.blob(), 'gpt_qa.xlsx');
+  };
 
   const handleExtract = async () => {
     const fd = new FormData();
@@ -129,19 +147,24 @@ const PDFUploader = () => {
     triggerDownload(await res.blob(), 'evaluation_results.xlsx');
   };
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
+  // ── Unified submit handler ─────────────────────────────────────────────────
 
-    if (mode === 'extract' && (!questionsPdf || !answersPdf)) {
-      setError('Please select both PDF files.');
+  const handleSubmit = async () => {
+    // Validation
+    if (mode === 'extract-gpt' && !singlePdf) {
+      setError('Please select a PDF file.');
       return;
     }
-    if (mode === 'evaluate' && (!questionsPdf || !answersPdf)) {
+    if ((mode === 'extract' || mode === 'evaluate') && (!questionsPdf || !answersPdf)) {
       setError('Please select both PDF files.');
       return;
     }
     if ((mode === 'evaluate-excel' || mode === 'clean-excel') && !qaExcel) {
       setError('Please select an Excel file.');
+      return;
+    }
+    if ((mode === 'evaluate' || mode === 'evaluate-excel') && (!agentId.trim() || !deploymentSlug.trim())) {
+      setError('Please provide Agent ID and Deployment Slug.');
       return;
     }
 
@@ -150,10 +173,13 @@ const PDFUploader = () => {
     setSuccess(false);
 
     try {
-      if (mode === 'extract') await handleExtract();
+      // Route to appropriate handler based on mode
+      if (mode === 'extract-gpt') await handleExtractGpt();
+      else if (mode === 'extract') await handleExtract();
       else if (mode === 'evaluate') await handleEvaluate();
       else if (mode === 'evaluate-excel') await handleEvaluateExcel();
-      else await handleCleanExcel();
+      else if (mode === 'clean-excel') await handleCleanExcel();
+
       setSuccess(true);
       resetInputs();
     } catch (err) {
@@ -163,215 +189,95 @@ const PDFUploader = () => {
     }
   };
 
+  // ── Compute canSubmit logic ────────────────────────────────────────────────
+
   const canSubmit =
-    mode === 'extract'
+    mode === 'extract-gpt'
+      ? !!singlePdf
+      : mode === 'extract'
       ? questionsPdf && answersPdf
       : mode === 'evaluate'
       ? questionsPdf && answersPdf && agentId.trim() && deploymentSlug.trim()
       : mode === 'clean-excel'
       ? !!qaExcel
-      : qaExcel && agentId.trim() && deploymentSlug.trim();
+      : qaExcel && agentId.trim() && deploymentSlug.trim(); // evaluate-excel
 
-  const isEvaluateMode = mode === 'evaluate' || mode === 'evaluate-excel';
-
-  // ── labels / button text ───────────────────────────────────────────────────
-
-  const titles = {
-    extract: 'Extract Q&A to Excel',
-    evaluate: 'Evaluate via AI (PDFs)',
-    'evaluate-excel': 'Evaluate via AI (Excel)',
-    'clean-excel': 'Clean Questions in Excel',
-  };
-
-  const buttonLabels = {
-    extract: { idle: 'Extract & Download Excel', busy: 'Processing...' },
-    evaluate: { idle: 'Evaluate & Download Results', busy: 'Evaluating… this may take a while' },
-    'evaluate-excel': { idle: 'Evaluate & Download Results', busy: 'Evaluating… this may take a while' },
-    'clean-excel': { idle: 'Clean & Download Excel', busy: 'Cleaning...' },
-  };
+  // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <div className="uploader-container">
-      {/* ── Mode tabs ── */}
-      <div className="mode-tabs">
-        <button
-          type="button"
-          className={`mode-tab ${mode === 'extract' ? 'active' : ''}`}
-          onClick={() => handleModeChange('extract')}
-          disabled={loading}
-        >
-          Extract Q&amp;A
-        </button>
-        <button
-          type="button"
-          className={`mode-tab ${mode === 'evaluate' ? 'active' : ''}`}
-          onClick={() => handleModeChange('evaluate')}
-          disabled={loading}
-        >
-          Evaluate (PDFs)
-        </button>
-        <button
-          type="button"
-          className={`mode-tab ${mode === 'evaluate-excel' ? 'active' : ''}`}
-          onClick={() => handleModeChange('evaluate-excel')}
-          disabled={loading}
-        >
-          Evaluate (Excel)
-        </button>
-        <button
-          type="button"
-          className={`mode-tab ${mode === 'clean-excel' ? 'active' : ''}`}
-          onClick={() => handleModeChange('clean-excel')}
-          disabled={loading}
-        >
-          Clean Excel
-        </button>
-      </div>
+      <ModeSelector mode={mode} loading={loading} onModeChange={handleModeChange} />
 
-      <form onSubmit={handleSubmit} className="upload-form">
-        <h2>{titles[mode]}</h2>
+      {mode === 'extract-gpt' && (
+        <GptExtractor
+          singlePdf={singlePdf}
+          gptModel={gptModel}
+          loading={loading}
+          error={error}
+          success={success}
+          onPdfChange={(e, label) => handlePdfChange(e, setSinglePdf, label)}
+          onModelChange={setGptModel}
+          onSubmit={handleSubmit}
+          canSubmit={canSubmit}
+        />
+      )}
 
-        {/* Info banners */}
-        {mode === 'evaluate' && (
-          <div className="evaluate-info">
-            Each question is sent to the knowledge base API and the response is
-            compared against the correct answer from the answer key PDF. Results
-            are colour-coded in the downloaded Excel.
-          </div>
-        )}
-        {mode === 'evaluate-excel' && (
-          <div className="evaluate-info">
-            Upload the Excel file produced by <strong>Extract Q&amp;A</strong>. Each
-            question will be sent to the knowledge base API and the response
-            compared against the correct answer already in the file.
-          </div>
-        )}
-        {mode === 'clean-excel' && (
-          <div className="evaluate-info">
-            Upload an Excel file produced by <strong>Extract Q&amp;A</strong>. Noise
-            such as anchor tags, marketing text, and page-break markers will be
-            stripped from the <strong>Question</strong> column. All other columns
-            are left untouched.
-          </div>
-        )}
+      {mode === 'extract' && (
+        <PdfExtractor
+          questionsPdf={questionsPdf}
+          answersPdf={answersPdf}
+          loading={loading}
+          error={error}
+          success={success}
+          onPdfChange={(e, label, fileType) => {
+            if (fileType === 'questions') handlePdfChange(e, setQuestionsPdf, label);
+            else handlePdfChange(e, setAnswersPdf, label);
+          }}
+          onSubmit={handleSubmit}
+          canSubmit={canSubmit}
+        />
+      )}
 
-        {/* PDF inputs (extract + evaluate modes) */}
-        {(mode === 'extract' || mode === 'evaluate') && (
-          <>
-            <div className="file-input-group">
-              <label htmlFor="questions">Questions PDF *</label>
-              <input
-                ref={questionsInputRef}
-                id="questions"
-                type="file"
-                accept=".pdf"
-                onChange={(e) => handlePdfChange(e, setQuestionsPdf, 'Questions PDF')}
-                disabled={loading}
-                className="file-input"
-              />
-              {questionsPdf && (
-                <div className="file-info">
-                  {questionsPdf.name} ({(questionsPdf.size / 1024).toFixed(1)} KB)
-                </div>
-              )}
-            </div>
+      {mode === 'evaluate' && (
+        <PdfEvaluator
+          questionsPdf={questionsPdf}
+          answersPdf={answersPdf}
+          agentId={agentId}
+          deploymentSlug={deploymentSlug}
+          loading={loading}
+          error={error}
+          success={success}
+          onPdfChange={(e, label, fileType) => {
+            if (fileType === 'questions') handlePdfChange(e, setQuestionsPdf, label);
+            else handlePdfChange(e, setAnswersPdf, label);
+          }}
+          onAgentIdChange={setAgentId}
+          onDeploymentSlugChange={setDeploymentSlug}
+          onSubmit={handleSubmit}
+          canSubmit={canSubmit}
+        />
+      )}
 
-            <div className="file-input-group">
-              <label htmlFor="answers">Answers PDF *</label>
-              <input
-                ref={answersInputRef}
-                id="answers"
-                type="file"
-                accept=".pdf"
-                onChange={(e) => handlePdfChange(e, setAnswersPdf, 'Answers PDF')}
-                disabled={loading}
-                className="file-input"
-              />
-              {answersPdf && (
-                <div className="file-info">
-                  {answersPdf.name} ({(answersPdf.size / 1024).toFixed(1)} KB)
-                </div>
-              )}
-            </div>
-          </>
-        )}
-
-        {/* Excel input (evaluate-excel + clean-excel modes) */}
-        {(mode === 'evaluate-excel' || mode === 'clean-excel') && (
-          <div className="file-input-group">
-            <label htmlFor="qaExcel">Q&amp;A Excel file *</label>
-            <input
-              ref={excelInputRef}
-              id="qaExcel"
-              type="file"
-              accept=".xlsx,.xls"
-              onChange={handleExcelChange}
-              disabled={loading}
-              className="file-input"
-            />
-            {qaExcel && (
-              <div className="file-info">
-                {qaExcel.name} ({(qaExcel.size / 1024).toFixed(1)} KB)
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Agent config (evaluate modes) */}
-        {isEvaluateMode && (
-          <>
-            <div className="file-input-group">
-              <label htmlFor="agentId">Agent ID *</label>
-              <input
-                id="agentId"
-                type="text"
-                value={agentId}
-                onChange={(e) => setAgentId(e.target.value)}
-                disabled={loading}
-                className="text-input"
-                placeholder="e.g. 524829a7-ad2d-4bd4-b094-3a8ef5b62a9e"
-                autoComplete="off"
-              />
-            </div>
-            <div className="file-input-group">
-              <label htmlFor="deploymentSlug">Deployment Slug *</label>
-              <input
-                id="deploymentSlug"
-                type="text"
-                value={deploymentSlug}
-                onChange={(e) => setDeploymentSlug(e.target.value)}
-                disabled={loading}
-                className="text-input"
-                placeholder="e.g. test123"
-                autoComplete="off"
-              />
-            </div>
-          </>
-        )}
-
-        {error && <div className="error-message">{error}</div>}
-
-        {success && (
-          <div className="success-message">
-            {mode === 'extract'
-              ? 'Successfully extracted Q&A. Excel downloaded.'
-              : mode === 'clean-excel'
-              ? 'Questions cleaned. Cleaned Excel downloaded.'
-              : 'Evaluation complete. Results Excel downloaded.'}
-          </div>
-        )}
-
-        <button
-          type="submit"
-          disabled={loading || !canSubmit}
-          className={`submit-button ${isEvaluateMode ? 'evaluate' : ''}`}
-        >
-          {loading ? buttonLabels[mode].busy : buttonLabels[mode].idle}
-        </button>
-      </form>
-
+      {(mode === 'evaluate-excel' || mode === 'clean-excel') && (
+        <ExcelProcessor
+          mode={mode}
+          qaExcel={qaExcel}
+          agentId={agentId}
+          deploymentSlug={deploymentSlug}
+          loading={loading}
+          error={error}
+          success={success}
+          onExcelChange={handleExcelChange}
+          onAgentIdChange={setAgentId}
+          onDeploymentSlugChange={setDeploymentSlug}
+          onSubmit={handleSubmit}
+          canSubmit={canSubmit}
+        />
+      )}
     </div>
   );
 };
 
 export default PDFUploader;
+
+
