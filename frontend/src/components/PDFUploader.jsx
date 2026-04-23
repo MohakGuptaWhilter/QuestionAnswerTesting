@@ -37,8 +37,8 @@ const PDFUploader = () => {
       setError(`${label}: please select a PDF file.`);
       return;
     }
-    if (file.size > 50 * 1024 * 1024) {
-      setError(`${label}: file exceeds the 50 MB limit.`);
+    if (file.size > 500 * 1024 * 1024) {
+      setError(`${label}: file exceeds the 500 MB limit.`);
       return;
     }
     setter(file);
@@ -52,8 +52,8 @@ const PDFUploader = () => {
       setError('Please select an Excel file (.xlsx).');
       return;
     }
-    if (file.size > 50 * 1024 * 1024) {
-      setError('File exceeds the 50 MB limit.');
+    if (file.size > 500 * 1024 * 1024) {
+      setError('File exceeds the 500 MB limit.');
       return;
     }
     setQaExcel(file);
