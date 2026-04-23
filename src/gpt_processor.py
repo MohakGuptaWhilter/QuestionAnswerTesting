@@ -15,6 +15,7 @@ import os
 import re
 import json
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -41,24 +42,34 @@ _RENDER_ZOOM = 2.0   # 144 DPI — clear enough for equations without bloating i
 _VISION_PROMPT = """\
 You are an expert educational content extractor with strong mathematical OCR capability.
 
-Analyze the provided PDF page images and extract ALL questions and their complete answers/solutions.
+Analyze the provided PDF page images and extract ONLY questions and their answers/solutions.
 
-FORMATTING RULES (follow exactly):
-- All mathematical expressions → LaTeX notation
+━━ WHAT TO EXTRACT ━━
+• Numbered practice problems: 1.  2.  (i)  (ii)  Q1.  Q2.  etc.
+• Worked examples explicitly posed as problems: "Example 1: Find ...", "Ex. 2: Prove that ..."
+• Multiple-choice questions (include all option labels and text)
+• Fill-in-the-blank or short-answer questions
+
+━━ WHAT TO SKIP — do NOT extract ━━
+• Theory text, definitions, theorems, axioms, or proofs presented as expository content
+• Explanatory paragraphs, remarks, notes, motivating discussions, or introductions
+• Derivations or demonstrations that are NOT framed as an exercise or worked example with
+  an explicit question for the reader to answer
+• Section headings, chapter titles, or any instructional/descriptive prose
+
+━━ FORMATTING RULES (follow exactly) ━━
+• All mathematical expressions → LaTeX notation
     Inline:  $x^2 + 3x - 4 = 0$
     Display: $$\\int_0^1 x^2\\,dx = \\frac{1}{3}$$
-- Greek letters / special symbols → LaTeX: $\\alpha$, $\\theta$, $\\sqrt{2}$, $\\frac{a}{b}$
-- Geometric figures / diagrams → concise description in [square brackets]
+• Greek letters / special symbols → LaTeX: $\\alpha$, $\\theta$, $\\sqrt{2}$, $\\frac{a}{b}$
+• Geometric figures / diagrams → concise description in [square brackets]
     Example: [Circle with centre O, radius 5 cm; chord AB perpendicular to diameter CD]
-- Multiple-choice options → include all labels and text, e.g. (A) $2x$ (B) $x^2$ (C) $-x$ (D) $0$
-- Tables → reproduce as plain text with | separators
+• Multiple-choice options → include all labels and text, e.g. (A) $2x$ (B) $x^2$ (C) $-x$ (D) $0$
+• Tables → reproduce as plain text with | separators
 
-The pages come from an educational PDF and may contain:
-1. Worked examples ("Example 1", "Ex. 2") — solution appears immediately below
-   under "Solution:", "Sol.", "Ans:", etc.
-2. Numbered practice problems (1.  2.  Q1.  Q2.) — answers may be:
-   • Immediately after the question (inline), OR
-   • In a "Solutions" / "Answer Key" section later on these same pages
+Answers may appear:
+• Immediately after the question (inline), OR
+• In a "Solutions" / "Answer Key" section later on these same pages
 
 Return JSON {"items": [...]} — each item:
   "number"   : exact question identifier as shown (e.g. "1", "Q2", "Example 3")
@@ -66,11 +77,11 @@ Return JSON {"items": [...]} — each item:
   "answer"   : complete solution/answer with LaTeX for all math; null if not on these pages
 
 Rules:
-- Extract EVERY question and EVERY answer/solution visible on these pages — do not skip any.
 - If a question's answer is not on these pages, set "answer" to null.
 - If an answer entry has no corresponding question on these pages, set "question" to null.
 - Transcribe all equations exactly as shown — precision is critical.
 - Do NOT summarise, paraphrase, or omit steps from solutions.
+- Do NOT include theory or expository text even if it contains equations.
 """
 
 
@@ -254,23 +265,38 @@ def extract_qa_with_gpt(
     all_pairs: List[Dict] = []
 
     try:
+        # Pre-render all chunks sequentially (fitz doc is not thread-safe).
+        # Each entry: (section_index, list_of_base64_images)
+        chunks: List[Tuple[int, List[str]]] = []
         for bi in range(len(boundaries) - 1):
             sec_start, sec_end = boundaries[bi], boundaries[bi + 1]
-
-            # Collect all GPT items for this section across its page chunks
-            section_items: List[Dict] = []
             for chunk_s in range(sec_start, sec_end, _MAX_CHUNK):
                 chunk_e = min(chunk_s + _MAX_CHUNK, sec_end)
                 images = [_render_page_b64(doc, i) for i in range(chunk_s, chunk_e)]
-                try:
-                    section_items.extend(_call_gpt_vision(client, images, model))
-                except Exception:
-                    continue  # skip bad chunk, don't abort whole PDF
-
-            # Match within this section only — no cross-section bleed
-            all_pairs.extend(_match_section_items(section_items))
+                chunks.append((bi, images))
     finally:
         doc.close()
+
+    # Fire all GPT vision calls in parallel — same token spend, less wall time.
+    # Cap workers at 10 to avoid OpenAI rate-limit errors on large PDFs.
+    section_items_map: Dict[int, List[Dict]] = {}
+    max_workers = min(len(chunks), 10)
+
+    def _call_chunk(bi: int, images: List[str]) -> Tuple[int, List[Dict]]:
+        return bi, _call_gpt_vision(client, images, model)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_call_chunk, bi, imgs): bi for bi, imgs in chunks}
+        for future in as_completed(futures):
+            try:
+                bi, items = future.result()
+                section_items_map.setdefault(bi, []).extend(items)
+            except Exception:
+                continue  # skip bad chunk, don't abort whole PDF
+
+    # Reassemble sections in order, then match orphans within each section.
+    for bi in range(len(boundaries) - 1):
+        all_pairs.extend(_match_section_items(section_items_map.get(bi, [])))
 
     all_pairs.sort(key=lambda p: _sort_key(p.get("_key", "")))
     for p in all_pairs:
