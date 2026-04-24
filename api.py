@@ -1,9 +1,12 @@
 import os
+import re
 import tempfile
 from flask import Flask, request, send_file, jsonify
 from werkzeug.utils import secure_filename
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.styles import Font, PatternFill, Alignment, Color
+from openpyxl.cell.rich_text import CellRichText, TextBlock
+from openpyxl.cell.text import InlineFont
 from src.pdf_processor import PDFProcessor
 from src.quickstart import parse_pdf
 from src.helpers import (
@@ -13,6 +16,26 @@ from src.helpers import (
 from src.gpt_processor import extract_qa_with_gpt
 
 app = Flask(__name__)
+
+_FIGURE_URL_RE = re.compile(r'\[\[FIGURE_URL:([^\]]+)\]\]')
+_LINK_FONT = InlineFont(rFont='Calibri', family=2, sz=11, color=Color(rgb='FF0070C0'), u='single')
+
+
+def _question_as_rich_text(question: str):
+    urls = _FIGURE_URL_RE.findall(question)
+    if not urls:
+        return sanitize(_FIGURE_URL_RE.sub('', question).strip())
+
+    segments = re.split(r'\[\[FIGURE_URL:[^\]]+\]\]', question)
+    blocks = []
+    for i, seg in enumerate(segments):
+        cleaned = sanitize(seg).strip()
+        if cleaned:
+            blocks.append(TextBlock(InlineFont(), cleaned))
+        if i < len(urls):
+            blocks.append(TextBlock(_LINK_FONT, '\nView Figure\n'))
+
+    return CellRichText(*blocks) if blocks else ''
 
 UPLOAD_FOLDER = tempfile.gettempdir()
 ALLOWED_EXTENSIONS = {'pdf'}
@@ -70,19 +93,18 @@ def extract_qa():
             return jsonify({"error": error_msg}), 400
 
         questions_file = request.files['questions_pdf']
-        answers_file = request.files['answers_pdf']
+        answers_file   = request.files['answers_pdf']
 
         questions_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(questions_file.filename))
-        answers_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(answers_file.filename))
+        answers_path   = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(answers_file.filename))
 
         questions_file.save(questions_path)
         answers_file.save(answers_path)
 
-        questions_md = parse_pdf(questions_path)["markdown"]
-        processor = PDFProcessor(questions_path, answers_path)
+        questions_md  = parse_pdf(questions_path)["markdown"]
+        processor     = PDFProcessor(questions_path, answers_path)
         questions_list = processor.parse_questions(questions_md)
-        answers_text = processor.extract_text_from_pdf(answers_path)
-        answers_list = processor.parse_answers(answers_text)
+        answers_list   = processor.parse_answers(processor.extract_text_from_pdf(answers_path))
 
         if not questions_list:
             return jsonify({"error": "No questions could be extracted from the PDF"}), 422
@@ -102,10 +124,18 @@ def extract_qa():
 
         for idx, question in enumerate(questions_list, start=1):
             answer = answers_list[idx - 1] if idx - 1 < len(answers_list) else "N/A"
-            ws.append([idx, sanitize(question), sanitize(answer)])
-            ws.cell(idx + 1, 1).alignment = Alignment(horizontal="center", vertical="top")
-            ws.cell(idx + 1, 2).alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
-            ws.cell(idx + 1, 3).alignment = Alignment(horizontal="center", vertical="center")
+            urls   = _FIGURE_URL_RE.findall(question)
+
+            ws.append([idx, None, sanitize(answer)])
+            row = ws.max_row
+            q_cell = ws.cell(row, 2)
+            q_cell.value     = _question_as_rich_text(question)
+            q_cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+            ws.cell(row, 1).alignment = Alignment(horizontal="center", vertical="top")
+            ws.cell(row, 3).alignment = Alignment(horizontal="center", vertical="center")
+
+            if urls:
+                q_cell.hyperlink = urls[0]
 
         ws.column_dimensions['A'].width = 12
         ws.column_dimensions['B'].width = 60
@@ -130,7 +160,6 @@ def extract_qa():
                     os.remove(path)
             except Exception:
                 pass
-
 
 @app.route('/api/evaluate', methods=['POST'])
 def evaluate_qa():
