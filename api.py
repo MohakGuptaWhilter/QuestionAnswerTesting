@@ -4,38 +4,31 @@ import tempfile
 from flask import Flask, request, send_file, jsonify
 from werkzeug.utils import secure_filename
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Color
-from openpyxl.cell.rich_text import CellRichText, TextBlock
-from openpyxl.cell.text import InlineFont
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 from src.pdf_processor import PDFProcessor
 from src.quickstart import parse_pdf
 from src.helpers import (
     sanitize, clean_question,
     call_search_api, check_correctness, build_evaluation_excel,
+    latex_to_unicode,
 )
 from src.gpt_processor import extract_qa_with_gpt
 
 app = Flask(__name__)
 
 _FIGURE_URL_RE = re.compile(r'\[\[FIGURE_URL:([^\]]+)\]\]')
-_LINK_FONT = InlineFont(rFont='Calibri', family=2, sz=11, color=Color(rgb='FF0070C0'), u='single')
+_FIG_FONT = Font(color='0070C0', underline='single')
 
 
-def _question_as_rich_text(question: str):
-    urls = _FIGURE_URL_RE.findall(question)
-    if not urls:
-        return sanitize(_FIGURE_URL_RE.sub('', question).strip())
-
-    segments = re.split(r'\[\[FIGURE_URL:[^\]]+\]\]', question)
-    blocks = []
-    for i, seg in enumerate(segments):
-        cleaned = sanitize(seg).strip()
-        if cleaned:
-            blocks.append(TextBlock(InlineFont(), cleaned))
-        if i < len(urls):
-            blocks.append(TextBlock(_LINK_FONT, '\nView Figure\n'))
-
-    return CellRichText(*blocks) if blocks else ''
+def _inline_fig_labels(question: str) -> str:
+    """Replace each [[FIGURE_URL:...]] with [FIGURE1], [FIGURE2], … in reading order."""
+    counter = 0
+    def _sub(_):
+        nonlocal counter
+        counter += 1
+        return f'[FIGURE{counter}]'
+    return _FIGURE_URL_RE.sub(_sub, question)
 
 UPLOAD_FOLDER = tempfile.gettempdir()
 ALLOWED_EXTENSIONS = {'pdf'}
@@ -114,7 +107,10 @@ def extract_qa():
         ws = wb.active
         ws.title = "Q&A"
 
-        ws.append(["Question #", "Question", "Correct Answer"])
+        max_figs = max((len(_FIGURE_URL_RE.findall(q)) for q in questions_list), default=0)
+        ans_col  = 3 + max_figs
+        header   = ["Question #", "Question"] + [f"Figure {n}" for n in range(1, max_figs + 1)] + ["Correct Answer"]
+        ws.append(header)
         header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
         header_font = Font(color="FFFFFF", bold=True)
         for cell in ws[1]:
@@ -125,21 +121,25 @@ def extract_qa():
         for idx, question in enumerate(questions_list, start=1):
             answer = answers_list[idx - 1] if idx - 1 < len(answers_list) else "N/A"
             urls   = _FIGURE_URL_RE.findall(question)
+            q_text = latex_to_unicode(sanitize(_inline_fig_labels(question)))
 
-            ws.append([idx, None, sanitize(answer)])
+            ws.append([idx, q_text] + [None] * max_figs + [sanitize(answer)])
             row = ws.max_row
-            q_cell = ws.cell(row, 2)
-            q_cell.value     = _question_as_rich_text(question)
-            q_cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
             ws.cell(row, 1).alignment = Alignment(horizontal="center", vertical="top")
-            ws.cell(row, 3).alignment = Alignment(horizontal="center", vertical="center")
-
-            if urls:
-                q_cell.hyperlink = urls[0]
+            ws.cell(row, 2).alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+            for n, url in enumerate(urls):
+                fig_cell            = ws.cell(row, 3 + n)
+                fig_cell.value      = f"View Figure {n + 1}"
+                fig_cell.hyperlink  = url
+                fig_cell.font       = _FIG_FONT
+                fig_cell.alignment  = Alignment(horizontal="center", vertical="top")
+            ws.cell(row, ans_col).alignment = Alignment(horizontal="center", vertical="center")
 
         ws.column_dimensions['A'].width = 12
         ws.column_dimensions['B'].width = 60
-        ws.column_dimensions['C'].width = 18
+        for n in range(max_figs):
+            ws.column_dimensions[get_column_letter(3 + n)].width = 15
+        ws.column_dimensions[get_column_letter(ans_col)].width = 18
         wb.save(output_excel)
 
         return send_file(
@@ -347,7 +347,10 @@ def extract_gpt():
         ws = wb.active
         ws.title = "Q&A"
 
-        ws.append(["Question #", "Question", "Answer / Solution"])
+        max_figs = max((len(_FIGURE_URL_RE.findall(p["question"])) for p in pairs), default=0)
+        ans_col  = 3 + max_figs
+        header   = ["Question #", "Question"] + [f"Figure {n}" for n in range(1, max_figs + 1)] + ["Answer / Solution"]
+        ws.append(header)
         header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
         header_font = Font(color="FFFFFF", bold=True)
         for cell in ws[1]:
@@ -356,14 +359,27 @@ def extract_gpt():
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
         for idx, pair in enumerate(pairs, start=1):
-            ws.append([idx, sanitize(pair["question"]), sanitize(pair["answer"])])
-            ws.cell(idx + 1, 1).alignment = Alignment(horizontal="center", vertical="top")
-            ws.cell(idx + 1, 2).alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
-            ws.cell(idx + 1, 3).alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+            urls   = _FIGURE_URL_RE.findall(pair["question"])
+            q_text = latex_to_unicode(sanitize(_inline_fig_labels(pair["question"])))
+            a_text = latex_to_unicode(sanitize(pair["answer"]))
+
+            ws.append([idx, q_text] + [None] * max_figs + [a_text])
+            row = ws.max_row
+            ws.cell(row, 1).alignment = Alignment(horizontal="center", vertical="top")
+            ws.cell(row, 2).alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+            for n, url in enumerate(urls):
+                fig_cell            = ws.cell(row, 3 + n)
+                fig_cell.value      = f"View Figure {n + 1}"
+                fig_cell.hyperlink  = url
+                fig_cell.font       = _FIG_FONT
+                fig_cell.alignment  = Alignment(horizontal="center", vertical="top")
+            ws.cell(row, ans_col).alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
 
         ws.column_dimensions['A'].width = 12
         ws.column_dimensions['B'].width = 60
-        ws.column_dimensions['C'].width = 70
+        for n in range(max_figs):
+            ws.column_dimensions[get_column_letter(3 + n)].width = 15
+        ws.column_dimensions[get_column_letter(ans_col)].width = 70
 
         output_excel = os.path.join(app.config['UPLOAD_FOLDER'], 'gpt_qa.xlsx')
         wb.save(output_excel)

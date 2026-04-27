@@ -105,6 +105,208 @@ def check_correctness(api_response: str, correct_answer: str) -> str:
     return "Manual Review"
 
 
+# ── LaTeX → Unicode conversion ────────────────────────────────────────────────
+
+_SUP = {
+    '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴',
+    '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹',
+    '+': '⁺', '-': '⁻', '=': '⁼', '(': '⁽', ')': '⁾', 'n': 'ⁿ', 'i': 'ⁱ',
+}
+
+_SUB = {
+    '0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄',
+    '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉',
+    '+': '₊', '-': '₋', '=': '₌', '(': '₍', ')': '₎',
+    'a': 'ₐ', 'e': 'ₑ', 'o': 'ₒ', 'x': 'ₓ', 'h': 'ₕ', 'k': 'ₖ',
+    'l': 'ₗ', 'm': 'ₘ', 'n': 'ₙ', 'p': 'ₚ', 's': 'ₛ', 't': 'ₜ',
+    'i': 'ᵢ', 'r': 'ᵣ', 'u': 'ᵤ', 'v': 'ᵥ',
+}
+
+_GREEK = {
+    'alpha': 'α', 'beta': 'β', 'gamma': 'γ', 'delta': 'δ',
+    'epsilon': 'ε', 'varepsilon': 'ε', 'zeta': 'ζ', 'eta': 'η',
+    'theta': 'θ', 'vartheta': 'ϑ', 'iota': 'ι', 'kappa': 'κ',
+    'lambda': 'λ', 'mu': 'μ', 'nu': 'ν', 'xi': 'ξ',
+    'pi': 'π', 'varpi': 'ϖ', 'rho': 'ρ', 'varrho': 'ϱ',
+    'sigma': 'σ', 'varsigma': 'ς', 'tau': 'τ', 'upsilon': 'υ',
+    'phi': 'φ', 'varphi': 'φ', 'chi': 'χ', 'psi': 'ψ', 'omega': 'ω',
+    'Gamma': 'Γ', 'Delta': 'Δ', 'Theta': 'Θ', 'Lambda': 'Λ',
+    'Xi': 'Ξ', 'Pi': 'Π', 'Sigma': 'Σ', 'Upsilon': 'Υ',
+    'Phi': 'Φ', 'Psi': 'Ψ', 'Omega': 'Ω',
+}
+
+_SYMBOLS = {
+    'times': '×', 'div': '÷', 'pm': '±', 'mp': '∓',
+    'cdot': '·', 'cdots': '⋯', 'ldots': '…', 'dots': '…',
+    'leq': '≤', 'le': '≤', 'geq': '≥', 'ge': '≥',
+    'neq': '≠', 'ne': '≠', 'approx': '≈', 'equiv': '≡',
+    'sim': '∼', 'simeq': '≃', 'cong': '≅', 'propto': '∝',
+    'infty': '∞', 'partial': '∂', 'nabla': '∇',
+    'int': '∫', 'iint': '∬', 'iiint': '∭', 'oint': '∮',
+    'sum': '∑', 'prod': '∏',
+    'forall': '∀', 'exists': '∃', 'nexists': '∄',
+    'in': '∈', 'notin': '∉', 'ni': '∋',
+    'subset': '⊂', 'supset': '⊃', 'subseteq': '⊆', 'supseteq': '⊇',
+    'cup': '∪', 'cap': '∩', 'setminus': '∖', 'emptyset': '∅',
+    'rightarrow': '→', 'to': '→', 'Rightarrow': '⇒',
+    'leftarrow': '←', 'gets': '←', 'Leftarrow': '⇐',
+    'leftrightarrow': '↔', 'Leftrightarrow': '⟺',
+    'uparrow': '↑', 'downarrow': '↓', 'updownarrow': '↕',
+    'longrightarrow': '⟶', 'longleftarrow': '⟵', 'mapsto': '↦',
+    'angle': '∠', 'perp': '⊥', 'parallel': '∥',
+    'circ': '∘', 'bullet': '•', 'therefore': '∴', 'because': '∵',
+    'langle': '⟨', 'rangle': '⟩',
+    'lfloor': '⌊', 'rfloor': '⌋', 'lceil': '⌈', 'rceil': '⌉',
+    'oplus': '⊕', 'ominus': '⊖', 'otimes': '⊗', 'oslash': '⊘',
+    'hbar': 'ℏ', 'ell': 'ℓ', 'Re': 'ℜ', 'Im': 'ℑ', 'aleph': 'ℵ',
+    'vee': '∨', 'wedge': '∧', 'neg': '¬', 'lnot': '¬',
+    'mid': '∣', 'nmid': '∤', 'll': '≪', 'gg': '≫',
+    'triangle': '△', 'square': '□',
+    ',': '', ';': ' ', ':': ' ', '!': '',
+    'quad': '  ', 'qquad': '    ',
+    'left': '', 'right': '',
+}
+
+_SKIP_CMDS = frozenset({
+    'displaystyle', 'textstyle', 'scriptstyle', 'scriptscriptstyle',
+    'rm', 'bf', 'it', 'sf', 'tt', 'cal', 'frak', 'bb',
+    'limits', 'nolimits', 'nonumber',
+    'big', 'Big', 'bigg', 'Bigg',
+    'bigl', 'bigr', 'Bigl', 'Bigr', 'biggl', 'biggr', 'Biggl', 'Biggr',
+})
+
+_ARG_CMDS = frozenset({
+    'text', 'mathrm', 'mathbf', 'mathit', 'mathsf', 'mathtt',
+    'boldsymbol', 'overline', 'underline', 'widehat', 'widetilde',
+    'overrightarrow', 'overleftarrow', 'overbrace', 'underbrace',
+    'tilde', 'hat', 'bar', 'check', 'breve', 'acute', 'grave',
+    'dot', 'ddot', 'dddot', 'vec',
+    'mathcal', 'mathfrak', 'mathbb', 'operatorname',
+})
+
+
+def _extract_braced(s, pos):
+    """Return (content, next_pos) for the {…} group starting at pos."""
+    if pos >= len(s) or s[pos] != '{':
+        return '', pos
+    depth, start = 0, pos + 1
+    for i in range(pos, len(s)):
+        if s[i] == '{':
+            depth += 1
+        elif s[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return s[start:i], i + 1
+    return s[start:], len(s)
+
+
+def _cvt(expr):
+    """Convert a LaTeX math expression (no delimiters) to Unicode."""
+    out = []
+    i = 0
+    n = len(expr)
+    while i < n:
+        ch = expr[i]
+
+        if ch == '\\':
+            j = i + 1
+            if j >= n:
+                break
+            if expr[j] == '\\':
+                out.append('\n')
+                i = j + 1
+            elif expr[j] in '{}|.,':
+                out.append(expr[j])
+                i = j + 1
+            elif expr[j].isalpha():
+                k = j
+                while k < n and expr[k].isalpha():
+                    k += 1
+                cmd = expr[j:k]
+                i = k
+                if i < n and expr[i] == ' ':
+                    i += 1
+                if cmd == 'frac':
+                    num, i = _extract_braced(expr, i)
+                    den, i = _extract_braced(expr, i)
+                    out.append(f'{_cvt(num)}/{_cvt(den)}')
+                elif cmd == 'sqrt':
+                    if i < n and expr[i] == '[':
+                        end = expr.find(']', i)
+                        root = expr[i+1:end] if end != -1 else ''
+                        i = end + 1 if end != -1 else i
+                        content, i = _extract_braced(expr, i)
+                        root_u = {'2': '²', '3': '³', '4': '⁴'}.get(root.strip(), root)
+                        out.append(f'{root_u}√{_cvt(content)}')
+                    elif i < n and expr[i] == '{':
+                        content, i = _extract_braced(expr, i)
+                        out.append(f'√{_cvt(content)}')
+                    else:
+                        out.append('√')
+                elif cmd in ('underset', 'overset'):
+                    _, i = _extract_braced(expr, i)
+                    base, i = _extract_braced(expr, i)
+                    out.append(_cvt(base))
+                elif cmd in _ARG_CMDS:
+                    if i < n and expr[i] == '{':
+                        content, i = _extract_braced(expr, i)
+                        out.append(_cvt(content))
+                elif cmd in _SKIP_CMDS:
+                    pass
+                elif cmd in _GREEK:
+                    out.append(_GREEK[cmd])
+                elif cmd in _SYMBOLS:
+                    out.append(_SYMBOLS[cmd])
+                else:
+                    if i < n and expr[i] == '{':
+                        content, i = _extract_braced(expr, i)
+                        out.append(_cvt(content))
+            else:
+                sym = _SYMBOLS.get(expr[j], expr[j])
+                out.append(sym)
+                i = j + 1
+
+        elif ch == '^':
+            i += 1
+            if i < n and expr[i] == '{':
+                content, i = _extract_braced(expr, i)
+                out.append(''.join(_SUP.get(c, c) for c in _cvt(content)))
+            elif i < n:
+                out.append(_SUP.get(expr[i], expr[i]))
+                i += 1
+
+        elif ch == '_':
+            i += 1
+            if i < n and expr[i] == '{':
+                content, i = _extract_braced(expr, i)
+                out.append(''.join(_SUB.get(c, c) for c in _cvt(content)))
+            elif i < n:
+                out.append(_SUB.get(expr[i], expr[i]))
+                i += 1
+
+        elif ch in '{}':
+            i += 1
+
+        elif ch == '&':
+            out.append('\t')
+            i += 1
+
+        else:
+            out.append(ch)
+            i += 1
+
+    return ''.join(out)
+
+
+def latex_to_unicode(text: str) -> str:
+    """Replace $…$ and $$…$$ LaTeX regions with Unicode equivalents."""
+    if not text:
+        return text
+    text = re.sub(r'\$\$(.+?)\$\$', lambda m: _cvt(m.group(1)), text, flags=re.DOTALL)
+    text = re.sub(r'\$([^$\n]+?)\$', lambda m: _cvt(m.group(1)), text)
+    return text
+
+
 def build_evaluation_excel(
     questions: list,
     answers: list,
