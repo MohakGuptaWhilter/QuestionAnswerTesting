@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
 import ModeSelector from './common/ModeSelector';
-import GptExtractor from './modes/GptExtractor';
 import PdfExtractor from './modes/PdfExtractor';
 import PdfEvaluator from './modes/PdfEvaluator';
 import ExcelProcessor from './modes/ExcelProcessor';
+import PdfToImages from './modes/PdfToImages';
 import './PDFUploader.css';
 
 const PDFUploader = () => {
@@ -11,14 +11,13 @@ const PDFUploader = () => {
   const [mode, setMode] = useState('extract');
   const [questionsPdf, setQuestionsPdf] = useState(null);
   const [answersPdf, setAnswersPdf] = useState(null);
-  const [singlePdf, setSinglePdf] = useState(null);
   const [qaExcel, setQaExcel] = useState(null);
   const [agentId, setAgentId] = useState('');
   const [deploymentSlug, setDeploymentSlug] = useState('');
-  const [gptModel, setGptModel] = useState('gpt-4o-mini');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [success, setSuccess] = useState(false);
+  const [pdfToImagesResult, setPdfToImagesResult] = useState(null);
 
   // ── Mode change handler ────────────────────────────────────────────────────
 
@@ -63,7 +62,6 @@ const PDFUploader = () => {
   const resetInputs = () => {
     setQuestionsPdf(null);
     setAnswersPdf(null);
-    setSinglePdf(null);
     setQaExcel(null);
   };
 
@@ -79,19 +77,6 @@ const PDFUploader = () => {
   };
 
   // ── API handlers (mode-specific logic) ─────────────────────────────────────
-
-  const handleExtractGpt = async () => {
-    const fd = new FormData();
-    fd.append('pdf', singlePdf);
-    fd.append('model', gptModel);
-
-    const res = await fetch('/api/extract-gpt', { method: 'POST', body: fd });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || 'Failed to extract Q&A with GPT');
-    }
-    triggerDownload(await res.blob(), 'gpt_qa.xlsx');
-  };
 
   const handleExtract = async () => {
     const fd = new FormData();
@@ -133,6 +118,19 @@ const PDFUploader = () => {
     triggerDownload(await res.blob(), 'cleaned_qa.xlsx');
   };
 
+  const handlePdfToImages = async () => {
+    const fd = new FormData();
+    fd.append('questions_pdf', questionsPdf);
+    fd.append('answers_pdf', answersPdf);
+
+    const res = await fetch('/api/pdf-to-images', { method: 'POST', body: fd });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `Server error ${res.status}`);
+    }
+    triggerDownload(await res.blob(), 'questions_output.xlsx');
+  };
+
   const handleEvaluateExcel = async () => {
     const fd = new FormData();
     fd.append('qa_excel', qaExcel);
@@ -151,11 +149,7 @@ const PDFUploader = () => {
 
   const handleSubmit = async () => {
     // Validation
-    if (mode === 'extract-gpt' && !singlePdf) {
-      setError('Please select a PDF file.');
-      return;
-    }
-    if ((mode === 'extract' || mode === 'evaluate') && (!questionsPdf || !answersPdf)) {
+    if ((mode === 'extract' || mode === 'evaluate' || mode === 'pdf-to-images') && (!questionsPdf || !answersPdf)) {
       setError('Please select both PDF files.');
       return;
     }
@@ -174,8 +168,8 @@ const PDFUploader = () => {
 
     try {
       // Route to appropriate handler based on mode
-      if (mode === 'extract-gpt') await handleExtractGpt();
-      else if (mode === 'extract') await handleExtract();
+      if (mode === 'extract') await handleExtract();
+      else if (mode === 'pdf-to-images') await handlePdfToImages();
       else if (mode === 'evaluate') await handleEvaluate();
       else if (mode === 'evaluate-excel') await handleEvaluateExcel();
       else if (mode === 'clean-excel') await handleCleanExcel();
@@ -192,9 +186,7 @@ const PDFUploader = () => {
   // ── Compute canSubmit logic ────────────────────────────────────────────────
 
   const canSubmit =
-    mode === 'extract-gpt'
-      ? !!singlePdf
-      : mode === 'extract'
+    mode === 'extract' || mode === 'pdf-to-images'
       ? questionsPdf && answersPdf
       : mode === 'evaluate'
       ? questionsPdf && answersPdf && agentId.trim() && deploymentSlug.trim()
@@ -208,20 +200,6 @@ const PDFUploader = () => {
     <div className="uploader-container">
       <ModeSelector mode={mode} loading={loading} onModeChange={handleModeChange} />
 
-      {mode === 'extract-gpt' && (
-        <GptExtractor
-          singlePdf={singlePdf}
-          gptModel={gptModel}
-          loading={loading}
-          error={error}
-          success={success}
-          onPdfChange={(e, label) => handlePdfChange(e, setSinglePdf, label)}
-          onModelChange={setGptModel}
-          onSubmit={handleSubmit}
-          canSubmit={canSubmit}
-        />
-      )}
-
       {mode === 'extract' && (
         <PdfExtractor
           questionsPdf={questionsPdf}
@@ -229,6 +207,23 @@ const PDFUploader = () => {
           loading={loading}
           error={error}
           success={success}
+          onPdfChange={(e, label, fileType) => {
+            if (fileType === 'questions') handlePdfChange(e, setQuestionsPdf, label);
+            else handlePdfChange(e, setAnswersPdf, label);
+          }}
+          onSubmit={handleSubmit}
+          canSubmit={canSubmit}
+        />
+      )}
+
+      {mode === 'pdf-to-images' && (
+        <PdfToImages
+          questionsPdf={questionsPdf}
+          answersPdf={answersPdf}
+          loading={loading}
+          error={error}
+          success={success}
+          result={pdfToImagesResult}
           onPdfChange={(e, label, fileType) => {
             if (fileType === 'questions') handlePdfChange(e, setQuestionsPdf, label);
             else handlePdfChange(e, setAnswersPdf, label);

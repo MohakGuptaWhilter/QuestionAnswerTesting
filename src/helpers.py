@@ -113,6 +113,12 @@ _SUP = {
     '+': '⁺', '-': '⁻', '=': '⁼', '(': '⁽', ')': '⁾', 'n': 'ⁿ', 'i': 'ⁱ',
 }
 
+_HAT = {
+    'i': 'î', 'j': 'ĵ', 'k': 'k̂',
+    'x': 'x̂', 'y': 'ŷ', 'z': 'ẑ',
+    'n': 'n̂', 'r': 'r̂',
+}
+
 _SUB = {
     '0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄',
     '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉',
@@ -165,6 +171,17 @@ _SYMBOLS = {
     ',': '', ';': ' ', ':': ' ', '!': '',
     'quad': '  ', 'qquad': '    ',
     'left': '', 'right': '',
+    # Math function names — strip backslash, keep word as-is
+    'sin': 'sin', 'cos': 'cos', 'tan': 'tan',
+    'cot': 'cot', 'sec': 'sec', 'csc': 'csc',
+    'arcsin': 'arcsin', 'arccos': 'arccos', 'arctan': 'arctan',
+    'sinh': 'sinh', 'cosh': 'cosh', 'tanh': 'tanh', 'coth': 'coth',
+    'log': 'log', 'ln': 'ln', 'exp': 'exp',
+    'lim': 'lim', 'limsup': 'lim sup', 'liminf': 'lim inf',
+    'max': 'max', 'min': 'min', 'sup': 'sup', 'inf': 'inf',
+    'det': 'det', 'dim': 'dim', 'deg': 'deg',
+    'gcd': 'gcd', 'lcm': 'lcm', 'mod': 'mod',
+    'Pr': 'Pr', 'ker': 'ker', 'arg': 'arg',
 }
 
 _SKIP_CMDS = frozenset({
@@ -247,6 +264,33 @@ def _cvt(expr):
                     _, i = _extract_braced(expr, i)
                     base, i = _extract_braced(expr, i)
                     out.append(_cvt(base))
+                elif cmd in ('overrightarrow', 'vec'):
+                    if i < n and expr[i] == '{':
+                        content, i = _extract_braced(expr, i)
+                        s = _cvt(content)
+                    elif i < n and expr[i].isalpha():
+                        s = expr[i]; i += 1
+                    else:
+                        s = ''
+                    out.append(s + '⃗' if len(s) == 1 else f'({s})⃗')
+                elif cmd == 'overleftarrow':
+                    if i < n and expr[i] == '{':
+                        content, i = _extract_braced(expr, i)
+                        s = _cvt(content)
+                    elif i < n and expr[i].isalpha():
+                        s = expr[i]; i += 1
+                    else:
+                        s = ''
+                    out.append(s + '⃖' if len(s) == 1 else f'({s})⃖')
+                elif cmd == 'hat':
+                    if i < n and expr[i] == '{':
+                        content, i = _extract_braced(expr, i)
+                    elif i < n and expr[i].isalpha():
+                        content = expr[i]; i += 1
+                    else:
+                        content = ''
+                    c = _cvt(content).strip()
+                    out.append(_HAT.get(c, c + '̂'))
                 elif cmd in _ARG_CMDS:
                     if i < n and expr[i] == '{':
                         content, i = _extract_braced(expr, i)
@@ -299,11 +343,44 @@ def _cvt(expr):
 
 
 def latex_to_unicode(text: str) -> str:
-    """Replace $…$ and $$…$$ LaTeX regions with Unicode equivalents."""
+    """Replace LaTeX math and common markup in LLM output with Unicode equivalents.
+
+    Handles: \\(...\\), \\[...\\], $$...$$, $...$, <sup>, <sub>, bare HTML tags.
+    """
     if not text:
         return text
-    text = re.sub(r'\$\$(.+?)\$\$', lambda m: _cvt(m.group(1)), text, flags=re.DOTALL)
+    # HTML sup/sub → Unicode
+    text = re.sub(r'<sup>(.*?)</sup>',
+                  lambda m: ''.join(_SUP.get(c, c) for c in m.group(1).strip()),
+                  text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'<sub>(.*?)</sub>',
+                  lambda m: ''.join(_SUB.get(c, c) for c in m.group(1).strip()),
+                  text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'<[^>]+>', '', text)   # strip remaining HTML tags
+    # \[...\] display math
+    text = re.sub(r'\\\[(.+?)\\\]', lambda m: _cvt(m.group(1)), text, flags=re.DOTALL)
+    # \(...\) inline math  (most common from vision-model output)
+    text = re.sub(r'\\\((.+?)\\\)', lambda m: _cvt(m.group(1)), text, flags=re.DOTALL)
+    # $$...$$ and $...$
+    text = re.sub(r'\$\$(.+?)\$\$',  lambda m: _cvt(m.group(1)), text, flags=re.DOTALL)
     text = re.sub(r'\$([^$\n]+?)\$', lambda m: _cvt(m.group(1)), text)
+    # Bare ^{...} / _{...} and ^n / _n outside any math delimiter.
+    # Vision models frequently write answer-choice lines without delimiters,
+    # so only the first (stem) line converts otherwise.
+    def _sup_group(m):
+        s = m.group(1)
+        return ''.join(_SUP.get(c, c) for c in s) if all(c in _SUP for c in s) else f'^({s})'
+    def _sub_group(m):
+        s = m.group(1)
+        return ''.join(_SUB.get(c, c) for c in s) if all(c in _SUB for c in s) else f'_({s})'
+    text = re.sub(r'\^\{([^{}]+)\}', _sup_group, text)
+    text = re.sub(r'_\{([^{}]+)\}',  _sub_group, text)
+    # Multi-digit / signed numeric bare scripts: x^-12, H_20
+    text = re.sub(r'\^(-?\d+)', lambda m: ''.join(_SUP.get(c, c) for c in m.group(1)), text)
+    text = re.sub(r'_(-?\d+)',  lambda m: ''.join(_SUB.get(c, c) for c in m.group(1)), text)
+    # Single-letter bare scripts: x^n, x_i, a_k — handle after multi-digit so ^12 isn't split
+    text = re.sub(r'\^([a-zA-Z])', lambda m: _SUP.get(m.group(1), m.group(1)), text)
+    text = re.sub(r'_([a-zA-Z])',  lambda m: _SUB.get(m.group(1), m.group(1)), text)
     return text
 
 

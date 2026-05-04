@@ -3,8 +3,8 @@ import './ModeSelector.css';
 
 const ModeSelector = ({ mode, loading, onModeChange }) => {
   const modes = [
-    { id: 'extract-gpt', label: 'Extract (GPT)' },
     { id: 'extract', label: 'Extract Q&A' },
+    { id: 'pdf-to-images', label: 'PDF to Images' },
     { id: 'evaluate', label: 'Evaluate (PDFs)' },
     { id: 'evaluate-excel', label: 'Evaluate (Excel)' },
     { id: 'clean-excel', label: 'Clean Excel' },
