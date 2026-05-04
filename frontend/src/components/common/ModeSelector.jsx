@@ -5,9 +5,11 @@ const ModeSelector = ({ mode, loading, onModeChange }) => {
   const modes = [
     { id: 'extract', label: 'Extract Q&A' },
     { id: 'pdf-to-images', label: 'PDF to Images' },
-    { id: 'evaluate', label: 'Evaluate (PDFs)' },
-    { id: 'evaluate-excel', label: 'Evaluate (Excel)' },
-    { id: 'clean-excel', label: 'Clean Excel' },
+    { id: 'mathpix', label: 'Extract (Mathpix)' },
+    { id: 'validate', label: 'Validate Q&A' },
+    // { id: 'evaluate', label: 'Evaluate (PDFs)' },
+    // { id: 'evaluate-excel', label: 'Evaluate (Excel)' },
+    // { id: 'clean-excel', label: 'Clean Excel' },
   ];
 
   return (

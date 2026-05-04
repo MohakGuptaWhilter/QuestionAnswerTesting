@@ -44,23 +44,7 @@ class PDFProcessor:
         self.answers = []
 
     def extract_text_from_pdf(self, pdf_path: str) -> str:
-        """
-        Extract all text from a PDF file.
-
-        Uses PyMuPDF (best Unicode/math symbol support) → pdfplumber → PyPDF2
-        as a fallback chain so that Greek letters, mathematical operators,
-        subscripts, superscripts, and chemical formulas are preserved.
-
-        Args:
-            pdf_path: Path to the PDF file
-
-        Returns:
-            Extracted text from the PDF
-
-        Raises:
-            FileNotFoundError: If PDF file doesn't exist
-            Exception: If PDF reading fails
-        """
+        """Extract all text from a PDF file using PyMuPDF then pdfplumber as fallback."""
         if not os.path.exists(pdf_path):
             raise FileNotFoundError(f"PDF file not found: {pdf_path}")
 
@@ -76,7 +60,7 @@ class PDFProcessor:
                 if text.strip():
                     return text
             except Exception:
-                pass  # fall through to next extractor
+                pass
 
         # --- pdfplumber (good ligature/layout handling) ---
         if _PDFPLUMBER_AVAILABLE:
@@ -94,8 +78,8 @@ class PDFProcessor:
                 pass
 
         raise Exception(
-            f"No PDF extraction library available. "
-            f"Install pymupdf or pdfplumber."
+            "No PDF extraction library available. "
+            "Install pymupdf or pdfplumber."
         )
 
     def parse_questions(self, text: str) -> List[str]:

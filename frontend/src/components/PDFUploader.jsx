@@ -1,9 +1,11 @@
 import React, { useState } from 'react';
 import ModeSelector from './common/ModeSelector';
 import PdfExtractor from './modes/PdfExtractor';
-import PdfEvaluator from './modes/PdfEvaluator';
-import ExcelProcessor from './modes/ExcelProcessor';
+// import PdfEvaluator from './modes/PdfEvaluator';
+// import ExcelProcessor from './modes/ExcelProcessor';
 import PdfToImages from './modes/PdfToImages';
+import MathpixExtractor from './modes/MathpixExtractor';
+import ValidateQA from './modes/ValidateQA';
 import './PDFUploader.css';
 
 const PDFUploader = () => {
@@ -11,9 +13,11 @@ const PDFUploader = () => {
   const [mode, setMode] = useState('extract');
   const [questionsPdf, setQuestionsPdf] = useState(null);
   const [answersPdf, setAnswersPdf] = useState(null);
-  const [qaExcel, setQaExcel] = useState(null);
-  const [agentId, setAgentId] = useState('');
-  const [deploymentSlug, setDeploymentSlug] = useState('');
+  const [excelFile, setExcelFile] = useState(null);
+  // const [qaExcel, setQaExcel] = useState(null);
+  // const [agentId, setAgentId] = useState('');
+  // const [deploymentSlug, setDeploymentSlug] = useState('');
+  const [mathpixModel, setMathpixModel] = useState('text');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [success, setSuccess] = useState(false);
@@ -44,25 +48,41 @@ const PDFUploader = () => {
     setError(null);
   };
 
+  // const handleExcelChange = (e) => {
+  //   const file = e.target.files[0];
+  //   if (!file) return;
+  //   if (!file.name.match(/\.(xlsx|xls)$/i)) {
+  //     setError('Please select an Excel file (.xlsx).');
+  //     return;
+  //   }
+  //   if (file.size > 500 * 1024 * 1024) {
+  //     setError('File exceeds the 500 MB limit.');
+  //     return;
+  //   }
+  //   setQaExcel(file);
+  //   setError(null);
+  // };
+
   const handleExcelChange = (e) => {
     const file = e.target.files[0];
     if (!file) return;
     if (!file.name.match(/\.(xlsx|xls)$/i)) {
-      setError('Please select an Excel file (.xlsx).');
+      setError('Please select an Excel file (.xlsx or .xls).');
       return;
     }
     if (file.size > 500 * 1024 * 1024) {
       setError('File exceeds the 500 MB limit.');
       return;
     }
-    setQaExcel(file);
+    setExcelFile(file);
     setError(null);
   };
 
   const resetInputs = () => {
     setQuestionsPdf(null);
     setAnswersPdf(null);
-    setQaExcel(null);
+    setExcelFile(null);
+    // setQaExcel(null);
   };
 
   const triggerDownload = (blob, filename) => {
@@ -91,31 +111,43 @@ const PDFUploader = () => {
     triggerDownload(await res.blob(), 'qa_extract.xlsx');
   };
 
-  const handleEvaluate = async () => {
+  // const handleEvaluate = async () => {
+  //   const fd = new FormData();
+  //   fd.append('questions_pdf', questionsPdf);
+  //   fd.append('answers_pdf', answersPdf);
+  //   fd.append('agent_id', agentId.trim());
+  //   fd.append('deployment_slug', deploymentSlug.trim());
+  //   const res = await fetch('/api/evaluate', { method: 'POST', body: fd });
+  //   if (!res.ok) {
+  //     const err = await res.json().catch(() => ({}));
+  //     throw new Error(err.error || `Server error ${res.status}`);
+  //   }
+  //   triggerDownload(await res.blob(), 'evaluation_results.xlsx');
+  // };
+
+  // const handleCleanExcel = async () => {
+  //   const fd = new FormData();
+  //   fd.append('qa_excel', qaExcel);
+  //   const res = await fetch('/api/clean-excel', { method: 'POST', body: fd });
+  //   if (!res.ok) {
+  //     const err = await res.json().catch(() => ({}));
+  //     throw new Error(err.error || `Server error ${res.status}`);
+  //   }
+  //   triggerDownload(await res.blob(), 'cleaned_qa.xlsx');
+  // };
+
+  const handleMathpixExtract = async () => {
     const fd = new FormData();
     fd.append('questions_pdf', questionsPdf);
     fd.append('answers_pdf', answersPdf);
-    fd.append('agent_id', agentId.trim());
-    fd.append('deployment_slug', deploymentSlug.trim());
+    fd.append('model', mathpixModel);
 
-    const res = await fetch('/api/evaluate', { method: 'POST', body: fd });
+    const res = await fetch('/api/extract-mathpix', { method: 'POST', body: fd });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.error || `Server error ${res.status}`);
     }
-    triggerDownload(await res.blob(), 'evaluation_results.xlsx');
-  };
-
-  const handleCleanExcel = async () => {
-    const fd = new FormData();
-    fd.append('qa_excel', qaExcel);
-
-    const res = await fetch('/api/clean-excel', { method: 'POST', body: fd });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || `Server error ${res.status}`);
-    }
-    triggerDownload(await res.blob(), 'cleaned_qa.xlsx');
+    triggerDownload(await res.blob(), 'mathpix_output.xlsx');
   };
 
   const handlePdfToImages = async () => {
@@ -131,36 +163,53 @@ const PDFUploader = () => {
     triggerDownload(await res.blob(), 'questions_output.xlsx');
   };
 
-  const handleEvaluateExcel = async () => {
+  const handleValidate = async () => {
     const fd = new FormData();
-    fd.append('qa_excel', qaExcel);
-    fd.append('agent_id', agentId.trim());
-    fd.append('deployment_slug', deploymentSlug.trim());
+    fd.append('questions_pdf', questionsPdf);
+    fd.append('answers_pdf', answersPdf);
+    fd.append('excel', excelFile);
 
-    const res = await fetch('/api/evaluate-excel', { method: 'POST', body: fd });
+    const res = await fetch('/api/validate', { method: 'POST', body: fd });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.error || `Server error ${res.status}`);
     }
-    triggerDownload(await res.blob(), 'evaluation_results.xlsx');
+    triggerDownload(await res.blob(), 'validation_report.xlsx');
   };
+
+  // const handleEvaluateExcel = async () => {
+  //   const fd = new FormData();
+  //   fd.append('qa_excel', qaExcel);
+  //   fd.append('agent_id', agentId.trim());
+  //   fd.append('deployment_slug', deploymentSlug.trim());
+  //   const res = await fetch('/api/evaluate-excel', { method: 'POST', body: fd });
+  //   if (!res.ok) {
+  //     const err = await res.json().catch(() => ({}));
+  //     throw new Error(err.error || `Server error ${res.status}`);
+  //   }
+  //   triggerDownload(await res.blob(), 'evaluation_results.xlsx');
+  // };
 
   // ── Unified submit handler ─────────────────────────────────────────────────
 
   const handleSubmit = async () => {
     // Validation
-    if ((mode === 'extract' || mode === 'evaluate' || mode === 'pdf-to-images') && (!questionsPdf || !answersPdf)) {
+    if ((mode === 'extract' || mode === 'pdf-to-images' || mode === 'mathpix') && (!questionsPdf || !answersPdf)) {
       setError('Please select both PDF files.');
       return;
     }
-    if ((mode === 'evaluate-excel' || mode === 'clean-excel') && !qaExcel) {
-      setError('Please select an Excel file.');
+    if (mode === 'validate' && (!questionsPdf || !answersPdf || !excelFile)) {
+      setError('Please select both PDF files and the Excel sheet.');
       return;
     }
-    if ((mode === 'evaluate' || mode === 'evaluate-excel') && (!agentId.trim() || !deploymentSlug.trim())) {
-      setError('Please provide Agent ID and Deployment Slug.');
-      return;
-    }
+    // if ((mode === 'evaluate-excel' || mode === 'clean-excel') && !qaExcel) {
+    //   setError('Please select an Excel file.');
+    //   return;
+    // }
+    // if ((mode === 'evaluate' || mode === 'evaluate-excel') && (!agentId.trim() || !deploymentSlug.trim())) {
+    //   setError('Please provide Agent ID and Deployment Slug.');
+    //   return;
+    // }
 
     setLoading(true);
     setError(null);
@@ -170,9 +219,11 @@ const PDFUploader = () => {
       // Route to appropriate handler based on mode
       if (mode === 'extract') await handleExtract();
       else if (mode === 'pdf-to-images') await handlePdfToImages();
-      else if (mode === 'evaluate') await handleEvaluate();
-      else if (mode === 'evaluate-excel') await handleEvaluateExcel();
-      else if (mode === 'clean-excel') await handleCleanExcel();
+      else if (mode === 'mathpix') await handleMathpixExtract();
+      else if (mode === 'validate') await handleValidate();
+      // else if (mode === 'evaluate') await handleEvaluate();
+      // else if (mode === 'evaluate-excel') await handleEvaluateExcel();
+      // else if (mode === 'clean-excel') await handleCleanExcel();
 
       setSuccess(true);
       resetInputs();
@@ -186,13 +237,16 @@ const PDFUploader = () => {
   // ── Compute canSubmit logic ────────────────────────────────────────────────
 
   const canSubmit =
-    mode === 'extract' || mode === 'pdf-to-images'
-      ? questionsPdf && answersPdf
-      : mode === 'evaluate'
-      ? questionsPdf && answersPdf && agentId.trim() && deploymentSlug.trim()
-      : mode === 'clean-excel'
-      ? !!qaExcel
-      : qaExcel && agentId.trim() && deploymentSlug.trim(); // evaluate-excel
+    (mode === 'extract' || mode === 'pdf-to-images' || mode === 'mathpix')
+      ? !!(questionsPdf && answersPdf)
+      : mode === 'validate'
+      ? !!(questionsPdf && answersPdf && excelFile)
+      // : mode === 'evaluate'
+      // ? questionsPdf && answersPdf && agentId.trim() && deploymentSlug.trim()
+      // : mode === 'clean-excel'
+      // ? !!qaExcel
+      // : qaExcel && agentId.trim() && deploymentSlug.trim() // evaluate-excel
+      : false;
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
@@ -233,6 +287,25 @@ const PDFUploader = () => {
         />
       )}
 
+      {mode === 'validate' && (
+        <ValidateQA
+          questionsPdf={questionsPdf}
+          answersPdf={answersPdf}
+          excelFile={excelFile}
+          loading={loading}
+          error={error}
+          success={success}
+          onPdfChange={(e, label, fileType) => {
+            if (fileType === 'questions') handlePdfChange(e, setQuestionsPdf, label);
+            else handlePdfChange(e, setAnswersPdf, label);
+          }}
+          onExcelChange={handleExcelChange}
+          onSubmit={handleSubmit}
+          canSubmit={canSubmit}
+        />
+      )}
+
+      {/* DISABLED: Evaluate (PDFs)
       {mode === 'evaluate' && (
         <PdfEvaluator
           questionsPdf={questionsPdf}
@@ -252,7 +325,27 @@ const PDFUploader = () => {
           canSubmit={canSubmit}
         />
       )}
+      */}
 
+      {mode === 'mathpix' && (
+        <MathpixExtractor
+          questionsPdf={questionsPdf}
+          answersPdf={answersPdf}
+          model={mathpixModel}
+          loading={loading}
+          error={error}
+          success={success}
+          onPdfChange={(e, label, fileType) => {
+            if (fileType === 'questions') handlePdfChange(e, setQuestionsPdf, label);
+            else handlePdfChange(e, setAnswersPdf, label);
+          }}
+          onModelChange={setMathpixModel}
+          onSubmit={handleSubmit}
+          canSubmit={canSubmit}
+        />
+      )}
+
+      {/* DISABLED: Evaluate (Excel) + Clean Excel
       {(mode === 'evaluate-excel' || mode === 'clean-excel') && (
         <ExcelProcessor
           mode={mode}
@@ -269,6 +362,7 @@ const PDFUploader = () => {
           canSubmit={canSubmit}
         />
       )}
+      */}
     </div>
   );
 };

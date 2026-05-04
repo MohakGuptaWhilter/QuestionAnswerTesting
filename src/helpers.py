@@ -5,6 +5,20 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
 
+FIGURE_URL_RE = re.compile(r'\[\[FIGURE_URL:([^\]]+)\]\]')
+FIG_FONT = Font(color='0070C0', underline='single')
+
+
+def inline_fig_labels(question: str) -> str:
+    """Replace each [[FIGURE_URL:...]] with [FIGURE1], [FIGURE2], … in reading order."""
+    counter = 0
+    def _sub(_):
+        nonlocal counter
+        counter += 1
+        return f'[FIGURE{counter}]'
+    return FIGURE_URL_RE.sub(_sub, question)
+
+
 SEARCH_API_URL = "https://dev.api.kb.whilter.ai/api/search"
 _AUTH_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoiMGZkY2M5YmMtYzY0OC00YzRiLWE5NDUtNWE1NGJhZmYyZWI1IiwiZXhwIjoxNzc4OTkyNjI4fQ.vXssK0Dg3xWdOoVnq3zlZ1txrXtzjy7vZlQneeUmqHU"
 
@@ -382,6 +396,71 @@ def latex_to_unicode(text: str) -> str:
     text = re.sub(r'\^([a-zA-Z])', lambda m: _SUP.get(m.group(1), m.group(1)), text)
     text = re.sub(r'_([a-zA-Z])',  lambda m: _SUB.get(m.group(1), m.group(1)), text)
     return text
+
+
+def build_validation_excel(results: list, output_path: str) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Validation"
+
+    ws.append(["Q #", "PDF Question", "Excel Question", "PDF Answer", "Excel Answer", "Match", "Score %", "Status"])
+
+    header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    status_styles = {
+        "Correct":               (PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),
+                                  Font(color="006100", bold=True)),
+        "Incorrect":             (PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid"),
+                                  Font(color="9C0006", bold=True)),
+        "Manual Review":         (PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),
+                                  Font(color="9C6500", bold=True)),
+        "Not Found":             (PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid"),
+                                  Font(color="595959", bold=True)),
+        "Missing in Submission": (PatternFill(start_color="F2CEEF", end_color="F2CEEF", fill_type="solid"),
+                                  Font(color="7030A0", bold=True)),
+    }
+
+    for r in results:
+        ws.append([
+            r["q_num"],
+            sanitize(r["pdf_question"]),
+            sanitize(r["excel_question"]),
+            sanitize(r["pdf_answer"]),
+            sanitize(r["excel_answer"]),
+            r["match_type"],
+            r["match_score"],
+            r["status"],
+        ])
+        row = ws.max_row
+        ws.cell(row, 1).alignment = Alignment(horizontal="center", vertical="top")
+        ws.cell(row, 2).alignment = Alignment(horizontal="left",   vertical="top", wrap_text=True)
+        ws.cell(row, 3).alignment = Alignment(horizontal="left",   vertical="top", wrap_text=True)
+        ws.cell(row, 4).alignment = Alignment(horizontal="center", vertical="center")
+        ws.cell(row, 5).alignment = Alignment(horizontal="center", vertical="center")
+        ws.cell(row, 6).alignment = Alignment(horizontal="center", vertical="center")
+        ws.cell(row, 7).alignment = Alignment(horizontal="center", vertical="center")
+
+        fill, font = status_styles.get(r["status"], status_styles["Manual Review"])
+        status_cell = ws.cell(row, 8)
+        status_cell.fill = fill
+        status_cell.font = font
+        status_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    ws.column_dimensions['A'].width = 6
+    ws.column_dimensions['B'].width = 55
+    ws.column_dimensions['C'].width = 55
+    ws.column_dimensions['D'].width = 18
+    ws.column_dimensions['E'].width = 18
+    ws.column_dimensions['F'].width = 12
+    ws.column_dimensions['G'].width = 10
+    ws.column_dimensions['H'].width = 22
+
+    wb.save(output_path)
 
 
 def build_evaluation_excel(

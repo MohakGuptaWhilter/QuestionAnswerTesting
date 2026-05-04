@@ -1,0 +1,38 @@
+.validate-qa-form {
+  background: white;
+  border-radius: 12px;
+  padding: 30px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  margin-bottom: 30px;
+}
+
+.validate-qa-form h2 {
+  color: #333;
+  margin-top: 0;
+  margin-bottom: 10px;
+  font-size: 24px;
+}
+
+.form-description {
+  color: #666;
+  margin-bottom: 25px;
+  font-size: 14px;
+}
+
+.field-hint {
+  color: #888;
+  font-size: 12px;
+  margin-top: 4px;
+  margin-bottom: 0;
+}
+
+.field-hint code {
+  background: #f0f0f0;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.required {
+  color: #e53e3e;
+}
