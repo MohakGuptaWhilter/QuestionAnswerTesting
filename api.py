@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import tempfile
 from difflib import SequenceMatcher
 from flask import Flask, request, send_file, jsonify
@@ -24,6 +25,7 @@ from src.helpers import (
 from src.pdf_utils import (
     pdf_pages_to_png, extract_figures_from_pdf,
     build_question_mapping, crop_questions_from_pdf,
+    extract_figures_per_question,
 )
 from src.vision import call_vision_model
 from src.mathpix import call_mathpix
@@ -38,27 +40,58 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 
 
-_VALIDATE_OLLAMA_URL            = "http://localhost:11434/api/generate"
-_VALIDATE_OLLAMA_MODEL          = "deepseek-r1:14b"
-_VALIDATE_SIMILARITY_THRESHOLD  = 70
+_VLM_VALIDATE_URL   = "http://localhost:11434/api/chat"
+_VLM_VALIDATE_MODEL = "qwen2.5vl:7b"
+
+_VLM_COMPARE_PROMPT = (
+    "You are a precise exam-question validator.\n\n"
+    "The image shows a question cropped from the original exam PDF.\n"
+    "Below is the text that was transcribed for this question:\n\n"
+    "TRANSCRIPTION:\n{excel_text}\n\n"
+    "FIGURE PLACEHOLDERS: The transcription may contain tokens like [Figure 1], "
+    "[Figure 2], etc. Each token represents an embedded visual element (figure, "
+    "diagram, graph, or image-based answer option) at that position in the question. "
+    "A placeholder is correct if a visual element appears at the corresponding "
+    "position in the image, and the numbering follows reading order (top-to-bottom).\n\n"
+    "Decide whether the transcription is an accurate and complete representation "
+    "of the question in the image.\n\n"
+    "Evaluate:\n"
+    "1. Is the question stem word-for-word correct (wording, numbers, math, units)?\n"
+    "2. Are all answer choices present and correctly transcribed?\n"
+    "3. Is mathematical notation (fractions, exponents, symbols) accurately captured?\n"
+    "4. Are [Figure N] placeholders present wherever a visual appears, in the right positions?\n\n"
+    "If the transcription is not a perfect match, list each specific discrepancy in the "
+    "'issues' array. Each issue must be concrete and quote the conflicting text, e.g. "
+    "\"PDF says '4 m/s²' but transcription says '4 m/s'\", "
+    "\"Answer choice (3) is missing\", "
+    "\"[Figure 1] placeholder missing before the diagram\". "
+    "If there are no issues, return an empty array.\n\n"
+    'Return ONLY valid JSON with no surrounding text:\n'
+    '{{"match": true/false, "issues": ["specific discrepancy 1", "..."], "confidence": 0.0-1.0, "figure_count": N}}\n'
+    'where figure_count is the number of distinct visual elements (figures, diagrams, graphs) '
+    'visible in the image (not in the transcription).'
+)
 
 
-def _ollama_compare(source: str, extracted: str) -> dict:
-    prompt = (
-        f"SOURCE:\n{source}\n\nEXTRACTED:\n{extracted}\n\n"
-        "Are these two texts conveying the same question and content?\n\n"
-        'Return ONLY JSON:\n{"match": true/false, "issues": ["..."], "confidence": 0.0-1.0}'
-    )
+def _vlm_compare_question(image_path: str, excel_text: str) -> dict:
+    """Send the PDF question crop + Excel transcription to a VLM and get a match verdict."""
+    prompt = _VLM_COMPARE_PROMPT.format(excel_text=excel_text.strip() or "(empty)")
     try:
-        resp = _http.post(
-            _VALIDATE_OLLAMA_URL,
-            json={"model": _VALIDATE_OLLAMA_MODEL, "prompt": prompt, "stream": False},
-            timeout=60,
-        )
-        raw = resp.json()["response"]
+        with open(image_path, "rb") as fh:
+            image_b64 = base64.b64encode(fh.read()).decode()
+        payload = {
+            "model": _VLM_VALIDATE_MODEL,
+            "messages": [{"role": "user", "content": prompt, "images": [image_b64]}],
+            "stream": False,
+            "options": {"temperature": 0, "num_predict": 512},
+        }
+        resp = _http.post(_VLM_VALIDATE_URL, json=payload, timeout=120)
+        resp.raise_for_status()
+        raw = resp.json()["message"]["content"].strip()
         return json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
     except Exception as exc:
-        return {"match": False, "issues": [f"LLM error: {exc}"], "confidence": 0.0}
+        return {"match": False, "issues": [f"VLM error: {exc}"], "confidence": 0.0, "error": True}
+
 
 
 def _normalise_cols(df: pd.DataFrame) -> dict:
@@ -389,17 +422,9 @@ def pdf_to_images():
 
         pdf_pages_to_png(questions_path, pages_dir, prefix='questions')
         pdf_pages_to_png(answers_path,   pages_dir, prefix='answers')
-        q_crops  = crop_questions_from_pdf(questions_path, questions_dir)
-        fig_data = extract_figures_from_pdf(questions_path, figures_dir)
-        mapping  = build_question_mapping(questions_path, answers_path, fig_data)
-
-        # Both crop_questions_from_pdf and build_question_mapping detect the same
-        # markers in the same order, so index i in q_crops == index i in mapping.
-        crop_by_qnum = {
-            entry["question_num"]: q_crops[i]
-            for i, entry in enumerate(mapping)
-            if i < len(q_crops)
-        }
+        crop_by_qnum = crop_questions_from_pdf(questions_path, questions_dir)
+        fig_data     = extract_figures_from_pdf(questions_path, figures_dir)
+        mapping      = build_question_mapping(questions_path, answers_path, fig_data)
 
         result = []
         for entry in mapping:
@@ -407,7 +432,7 @@ def pdf_to_images():
             figs = entry.get("figure") or []
             if crop_path and os.path.exists(crop_path):
                 try:
-                    q_text = call_vision_model(crop_path, has_figures=bool(figs))
+                    q_text = call_vision_model(crop_path, figure_count=len(figs))
                 except Exception as vision_err:
                     q_text = f"[vision error: {vision_err}]"
             else:
@@ -495,15 +520,9 @@ def extract_mathpix():
 
         pdf_pages_to_png(questions_path, pages_dir, prefix='questions')
         pdf_pages_to_png(answers_path,   pages_dir, prefix='answers')
-        q_crops  = crop_questions_from_pdf(questions_path, questions_dir)
-        fig_data = extract_figures_from_pdf(questions_path, figures_dir)
-        mapping  = build_question_mapping(questions_path, answers_path, fig_data)
-
-        crop_by_qnum = {
-            entry["question_num"]: q_crops[i]
-            for i, entry in enumerate(mapping)
-            if i < len(q_crops)
-        }
+        crop_by_qnum = crop_questions_from_pdf(questions_path, questions_dir)
+        fig_data     = extract_figures_from_pdf(questions_path, figures_dir)
+        mapping      = build_question_mapping(questions_path, answers_path, fig_data)
 
         result = []
         for entry in mapping:
@@ -581,11 +600,10 @@ def validate_qa():
         answers_pdf    — PDF of answer key  (source of truth)
         excel          — .xlsx/.xls with columns: question_number, question_text, answer
 
-    Returns an Excel workbook with columns:
-        Q #, PDF Question, Excel Question, PDF Answer, Excel Answer,
-        Match, Score %, Status
+    Returns an Excel workbook with validation results per question.
     """
     questions_path = answers_path = excel_path = None
+    upload_folder = app.config['UPLOAD_FOLDER']
     try:
         # ── Input validation ──────────────────────────────────────────────────
         for field in ('questions_pdf', 'answers_pdf', 'excel'):
@@ -602,51 +620,30 @@ def validate_qa():
             return jsonify({"error": "excel must be an .xlsx or .xls file"}), 400
 
         # ── Save uploads ──────────────────────────────────────────────────────
-        questions_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(questions_file.filename))
-        answers_path   = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(answers_file.filename))
-        excel_path     = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(excel_file.filename))
+        questions_path = os.path.join(upload_folder, secure_filename(questions_file.filename))
+        answers_path   = os.path.join(upload_folder, secure_filename(answers_file.filename))
+        excel_path     = os.path.join(upload_folder, secure_filename(excel_file.filename))
 
         questions_file.save(questions_path)
         answers_file.save(answers_path)
         excel_file.save(excel_path)
 
-        # ── Extract questions from PDF via vision pipeline ────────────────────
-        base_dir      = os.getcwd()
-        questions_dir = os.path.join(base_dir, 'questions')
-        figures_dir   = os.path.join(base_dir, 'figures')
+        # ── Crop question images + extract figures per question ───────────────
+        base_dir         = os.getcwd()
+        questions_dir    = os.path.join(base_dir, 'questions')
+        check_images_dir = os.path.join(base_dir, 'check_images')
         os.makedirs(questions_dir, exist_ok=True)
-        os.makedirs(figures_dir, exist_ok=True)
+        os.makedirs(check_images_dir, exist_ok=True)
 
-        q_crops  = crop_questions_from_pdf(questions_path, questions_dir)
-        fig_data = extract_figures_from_pdf(questions_path, figures_dir)
-        mapping  = build_question_mapping(questions_path, answers_path, fig_data)
+        crop_by_qnum     = crop_questions_from_pdf(questions_path, questions_dir)
+        q_figures_by_num = extract_figures_per_question(questions_path, check_images_dir)
 
-        crop_by_qnum = {
-            entry["question_num"]: q_crops[i]
-            for i, entry in enumerate(mapping)
-            if i < len(q_crops)
-        }
+        if not crop_by_qnum:
+            return jsonify({"error": "No questions could be detected in questions_pdf"}), 422
 
-        pdf_entries = []
-        for entry in mapping:
-            crop_path = crop_by_qnum.get(entry["question_num"])
-            figs      = entry.get("figure") or []
-            if crop_path and os.path.exists(crop_path):
-                try:
-                    q_text = call_vision_model(crop_path, has_figures=bool(figs))
-                except Exception as vision_err:
-                    q_text = f"[vision error: {vision_err}]"
-            else:
-                q_text = ""
-
-            pdf_entries.append({
-                "question_num":  entry["question_num"],
-                "question_text": sanitize(latex_to_unicode(q_text)),
-                "answer":        sanitize(latex_to_unicode(entry.get("answer", "N/A") or "N/A")),
-            })
-
-        if not pdf_entries:
-            return jsonify({"error": "No questions could be extracted from questions_pdf"}), 422
+        # ── Parse answers from answers PDF (index-based: Q1 → index 0) ───────
+        processor    = PDFProcessor(questions_path, answers_path)
+        answers_list = processor.parse_answers(processor.extract_text_from_pdf(answers_path))
 
         # ── Load Excel ────────────────────────────────────────────────────────
         df   = pd.read_excel(excel_path)
@@ -655,6 +652,7 @@ def validate_qa():
         q_num_col  = _pick_col(norm, ['question_number', 'question_num', 'q_num', 'qnum', 'num'])
         q_text_col = _pick_col(norm, ['question_text', 'question', 'q_text', 'qtext'])
         ans_col    = _pick_col(norm, ['answer', 'correct_answer', 'answers'])
+        fig_col    = _pick_col(norm, ['figures', 'figure', 'figure_names'])
 
         if not q_num_col or not q_text_col:
             return jsonify({"error": "Excel must have question_number and question_text columns"}), 422
@@ -669,76 +667,84 @@ def validate_qa():
             except (ValueError, TypeError):
                 continue
             excel_by_qnum[q_num] = {
-                "question_text": str(row[q_text_col] or ""),
-                "answer":        str(row[ans_col] or "") if ans_col else "",
+                "question_text": "" if pd.isna(row[q_text_col]) else str(row[q_text_col]),
+                "answer":        ("" if pd.isna(row[ans_col]) else str(row[ans_col])) if ans_col else "",
+                "figures":       ("" if pd.isna(row[fig_col]) else str(row[fig_col])) if fig_col else "",
             }
 
-        # ── Compare PDF entries against Excel rows ────────────────────────────
-        results    = []
-        seen_qnums = set()
+        # ── VLM: for each Excel question, compare crop image + check figures ──
+        results = []
 
-        for entry in pdf_entries:
-            q_num = entry["question_num"]
-            seen_qnums.add(q_num)
-            pdf_q = entry["question_text"]
-            pdf_a = entry["answer"]
+        for q_num in sorted(excel_by_qnum.keys()):
+            exc_entry  = excel_by_qnum[q_num]
+            excel_q    = exc_entry["question_text"]
+            excel_a    = exc_entry["answer"]
+            excel_figs = exc_entry["figures"]
 
-            if q_num not in excel_by_qnum:
-                results.append({
-                    "q_num": q_num, "pdf_question": pdf_q, "excel_question": "",
-                    "pdf_answer": pdf_a, "excel_answer": "",
-                    "match_type": "Not Found", "match_score": 0, "status": "Not Found",
-                })
-                continue
+            pdf_a          = sanitize(latex_to_unicode(
+                answers_list[q_num - 1] if (q_num - 1) < len(answers_list) else "N/A"
+            ))
+            crop_path      = crop_by_qnum.get(q_num)
+            extracted_figs = q_figures_by_num.get(q_num, [])
 
-            excel_q = excel_by_qnum[q_num]["question_text"]
-            excel_a = excel_by_qnum[q_num]["answer"]
-
-            similarity = _fuzz.ratio(pdf_q, excel_q)
-
-            if similarity >= _VALIDATE_SIMILARITY_THRESHOLD:
-                match_type  = "Fuzzy"
-                match_score = round(similarity)
-                ans_sim     = _fuzz.ratio(pdf_a.strip(), excel_a.strip())
-                if not excel_a:
-                    status = "Manual Review"
-                elif ans_sim >= 80:
-                    status = "Correct"
-                else:
-                    status = "Incorrect"
+            if crop_path and os.path.exists(crop_path):
+                vlm_result      = _vlm_compare_question(crop_path, excel_q)
+                match_type      = "VLM"
+                match_score     = round(vlm_result.get("confidence", 0.0) * 100)
+                q_match         = None if vlm_result.get("error") else vlm_result.get("match", False)
+                issues          = vlm_result.get("issues") or []
+                reason          = "; ".join(issues) if issues else ""
+                image_fig_count = 0 if vlm_result.get("error") else int(vlm_result.get("figure_count", 0))
             else:
-                llm         = _ollama_compare(pdf_q, excel_q)
-                match_type  = "LLM"
-                match_score = round(llm.get("confidence", 0.0) * 100)
-                if llm.get("match"):
-                    ans_sim = _fuzz.ratio(pdf_a.strip(), excel_a.strip())
-                    if not excel_a:
-                        status = "Manual Review"
-                    elif ans_sim >= 80:
-                        status = "Correct"
-                    else:
-                        status = "Incorrect"
-                else:
-                    status = "Incorrect"
+                match_type      = "No Image"
+                match_score     = 0
+                q_match         = None
+                reason          = "No question image available"
+                image_fig_count = 0
+
+            # Figure match: compare extracted figure count vs Excel figure entries
+            excel_fig_names = [n.strip() for n in excel_figs.split(",") if n.strip()]
+            extracted_count = len(extracted_figs)
+            figures_match   = extracted_count == len(excel_fig_names)
+
+            if not figures_match:
+                fig_reason = (
+                    f"Figure mismatch: image has {extracted_count} figure(s), "
+                    f"Excel lists {len(excel_fig_names)}"
+                )
+                reason = f"{reason}; {fig_reason}" if reason else fig_reason
+
+            ans_sim = _fuzz.ratio(pdf_a.strip(), excel_a.strip())
+            if q_match is None:
+                status = "Manual Review"
+            elif not q_match:
+                status = "Incorrect"
+            elif not excel_a:
+                status = "Manual Review"
+            elif ans_sim >= 80:
+                status = "Correct"
+            else:
+                status = "Incorrect"
 
             results.append({
-                "q_num": q_num, "pdf_question": pdf_q, "excel_question": excel_q,
-                "pdf_answer": pdf_a, "excel_answer": excel_a,
-                "match_type": match_type, "match_score": match_score, "status": status,
+                "q_num":             q_num,
+                "excel_question":    excel_q,
+                "pdf_answer":        pdf_a,
+                "excel_answer":      excel_a,
+                "match_type":        match_type,
+                "match_score":       match_score,
+                "status":            status,
+                "reason":            reason,
+                "image_fig_count":   image_fig_count,
+                "validated_figures": ", ".join(os.path.basename(p) for p in extracted_figs),
+                "excel_figures":     excel_figs,
+                "figures_match":     figures_match,
             })
 
-        # Questions present in Excel but absent from the PDF extraction
-        for q_num, exc_entry in excel_by_qnum.items():
-            if q_num not in seen_qnums:
-                results.append({
-                    "q_num": q_num, "pdf_question": "", "excel_question": exc_entry["question_text"],
-                    "pdf_answer": "", "excel_answer": exc_entry["answer"],
-                    "match_type": "Not Found", "match_score": 0, "status": "Missing in Submission",
-                })
+        if not results:
+            return jsonify({"error": "No matching questions found between Excel and PDF"}), 422
 
-        results.sort(key=lambda r: r["q_num"])
-
-        output_excel = os.path.join(app.config['UPLOAD_FOLDER'], 'validation_output.xlsx')
+        output_excel = os.path.join(upload_folder, 'validation_output.xlsx')
         build_validation_excel(results, output_excel)
 
         return send_file(

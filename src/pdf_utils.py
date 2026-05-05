@@ -79,13 +79,16 @@ def build_question_mapping(questions_path: str, answers_path: str, fig_data: lis
     doc.close()
 
     def _find_question(img_page: int, img_y: float):
-        """Last marker whose start is at or before (img_page, img_y)."""
+        """Last marker whose start is at or before (img_page, img_y).
+        Falls back to Q1 for figures that appear above the first question marker."""
         result = None
         for q_num, q_page, q_y in markers:
             if q_page < img_page or (q_page == img_page and q_y <= img_y):
                 result = q_num
             else:
                 break
+        if result is None and markers:
+            result = markers[0][0]
         return result
 
     q_figures: dict = {q_num: [] for q_num, _, _ in markers}
@@ -105,12 +108,11 @@ def build_question_mapping(questions_path: str, answers_path: str, fig_data: lis
     return mapping
 
 
-def crop_questions_from_pdf(pdf_path: str, output_dir: str) -> list:
-    """Detect question boundaries via sequential numbered patterns and crop each
-    question region to its own PNG file.
+def extract_figures_per_question(pdf_path: str, output_base_dir: str) -> dict:
+    """Extract embedded images for each question's region in the PDF.
 
-    Key invariant: only a block whose number equals expected_next is accepted as a
-    question marker. Falls back to one PNG per page when no markers are found.
+    Saves each figure to output_base_dir/question_num_{q_num:03d}/figure_{n:03d}.ext
+    Returns {q_num: [list of saved figure paths]}.
     """
     doc = fitz.open(pdf_path)
     markers = []
@@ -127,32 +129,111 @@ def crop_questions_from_pdf(pdf_path: str, output_dir: str) -> list:
                 continue
             num = int(m.group(1))
             if expected_num is None or num == expected_num:
-                markers.append((page_idx, block[1]))
+                markers.append((num, page_idx, block[1]))
                 expected_num = num + 1
 
-    paths = []
+    if not markers:
+        doc.close()
+        return {}
+
+    q_ranges = {}
+    for q_idx, (q_num, page_idx, y_top) in enumerate(markers):
+        page_rect = doc[page_idx].rect
+        if q_idx + 1 < len(markers):
+            next_q_num, next_page_idx, next_y = markers[q_idx + 1]
+            y_bottom = next_y if next_page_idx == page_idx else page_rect.height
+        else:
+            y_bottom = page_rect.height
+        y0 = 0.0 if q_idx == 0 else max(0.0, y_top - 5)
+        q_ranges[q_num] = (page_idx, y0, y_bottom)
+
+    q_figures: dict = {q_num: [] for q_num in q_ranges}
+    seen_xrefs = set()
+    fig_idx = 1
+
+    for page_idx, page in enumerate(doc):
+        for img_info in page.get_images(full=True):
+            xref = img_info[0]
+            if xref in seen_xrefs:
+                continue
+            seen_xrefs.add(xref)
+            rects = page.get_image_rects(xref)
+            if not rects:
+                continue
+            img_y = rects[0].y0
+
+            assigned_q = None
+            for q_num, (q_page, y0, y_bottom) in q_ranges.items():
+                if q_page == page_idx and y0 <= img_y < y_bottom:
+                    assigned_q = q_num
+                    break
+            if assigned_q is None:
+                continue
+
+            base_image = doc.extract_image(xref)
+            ext = base_image["ext"]
+            q_dir = os.path.join(output_base_dir, f'question_num_{assigned_q:03d}')
+            os.makedirs(q_dir, exist_ok=True)
+            out_path = os.path.join(q_dir, f'figure_{fig_idx:03d}.{ext}')
+            with open(out_path, 'wb') as f:
+                f.write(base_image["image"])
+            q_figures[assigned_q].append(out_path)
+            fig_idx += 1
+
+    doc.close()
+    return q_figures
+
+
+def crop_questions_from_pdf(pdf_path: str, output_dir: str) -> dict:
+    """Detect question boundaries via sequential numbered patterns and crop each
+    question region to its own PNG file.
+
+    Returns {q_num: path} so callers always look up by question number, not index.
+    Falls back to {page_num: path} per page when no markers are found.
+    """
+    doc = fitz.open(pdf_path)
+    markers = []   # [(q_num, page_idx, y_top), ...]
+    expected_num = None
+
+    for page_idx, page in enumerate(doc):
+        blocks = sorted(page.get_text("blocks"), key=lambda b: (b[1], b[0]))
+        for block in blocks:
+            if block[6] != 0:
+                continue
+            first_line = block[4].strip().split('\n')[0]
+            m = _Q_PATTERN.match(first_line)
+            if not m:
+                continue
+            num = int(m.group(1))
+            if expected_num is None or num == expected_num:
+                markers.append((num, page_idx, block[1]))
+                expected_num = num + 1
+
+    crops = {}
 
     if not markers:
         for page_idx, page in enumerate(doc):
             pix = page.get_pixmap(matrix=_MAT)
             out_path = os.path.join(output_dir, f'question_{page_idx + 1:03d}.png')
             pix.save(out_path)
-            paths.append(out_path)
+            crops[page_idx + 1] = out_path
         doc.close()
-        return paths
+        return crops
 
-    for q_idx, (page_idx, y_top) in enumerate(markers):
+    for q_idx, (q_num, page_idx, y_top) in enumerate(markers):
         page = doc[page_idx]
         page_rect = page.rect
 
         if q_idx + 1 < len(markers):
-            next_page_idx, next_y = markers[q_idx + 1]
+            next_q_num, next_page_idx, next_y = markers[q_idx + 1]
             y_bottom = next_y if next_page_idx == page_idx else page_rect.height
         else:
             y_bottom = page_rect.height
 
         x0 = 0.0
-        y0 = max(0.0, y_top - 5)
+        # For the first question, start from the top of the page so any figure
+        # positioned above the question marker (e.g. a reference diagram) is included.
+        y0 = 0.0 if q_idx == 0 else max(0.0, y_top - 5)
         x1 = page_rect.width
         y1 = min(page_rect.height, y_bottom)
 
@@ -161,9 +242,9 @@ def crop_questions_from_pdf(pdf_path: str, output_dir: str) -> list:
 
         clip = fitz.Rect(x0, y0, x1, y1)
         pix = page.get_pixmap(matrix=_MAT, clip=clip)
-        out_path = os.path.join(output_dir, f'question_{q_idx + 1:03d}.png')
+        out_path = os.path.join(output_dir, f'question_{q_num:03d}.png')
         pix.save(out_path)
-        paths.append(out_path)
+        crops[q_num] = out_path
 
     doc.close()
-    return paths
+    return crops

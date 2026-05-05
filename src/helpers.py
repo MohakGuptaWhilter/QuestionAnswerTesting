@@ -3,6 +3,7 @@ import re
 import requests as http_requests
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 
 
 FIGURE_URL_RE = re.compile(r'\[\[FIGURE_URL:([^\]]+)\]\]')
@@ -403,7 +404,15 @@ def build_validation_excel(results: list, output_path: str) -> None:
     ws = wb.active
     ws.title = "Validation"
 
-    ws.append(["Q #", "PDF Question", "Excel Question", "PDF Answer", "Excel Answer", "Match", "Score %", "Status"])
+    has_figures = bool(results and "validated_figures" in results[0])
+
+    has_reason  = bool(results and "reason" in results[0])
+    header = ["Q #", "Excel Question", "PDF Answer", "Excel Answer", "Match", "Score %", "Status"]
+    if has_reason:
+        header.append("Reason")
+    if has_figures:
+        header += ["Image Figs", "Validated Figures", "Excel Figures", "Figs Match"]
+    ws.append(header)
 
     header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
@@ -424,41 +433,77 @@ def build_validation_excel(results: list, output_path: str) -> None:
         "Missing in Submission": (PatternFill(start_color="F2CEEF", end_color="F2CEEF", fill_type="solid"),
                                   Font(color="7030A0", bold=True)),
     }
+    fig_match_styles = {
+        True:  (PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"), Font(color="006100", bold=True)),
+        False: (PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid"), Font(color="9C0006", bold=True)),
+    }
 
     for r in results:
-        ws.append([
+        row_data = [
             r["q_num"],
-            sanitize(r["pdf_question"]),
             sanitize(r["excel_question"]),
             sanitize(r["pdf_answer"]),
             sanitize(r["excel_answer"]),
             r["match_type"],
             r["match_score"],
             r["status"],
-        ])
+        ]
+        if has_reason:
+            row_data.append(sanitize(r.get("reason", "")))
+        if has_figures:
+            fm = r.get("figures_match")
+            row_data += [
+                r.get("image_fig_count", 0),
+                sanitize(r.get("validated_figures", "")),
+                sanitize(r.get("excel_figures", "")),
+                "N/A" if fm is None else ("Yes" if fm else "No"),
+            ]
+        ws.append(row_data)
         row = ws.max_row
         ws.cell(row, 1).alignment = Alignment(horizontal="center", vertical="top")
         ws.cell(row, 2).alignment = Alignment(horizontal="left",   vertical="top", wrap_text=True)
-        ws.cell(row, 3).alignment = Alignment(horizontal="left",   vertical="top", wrap_text=True)
+        ws.cell(row, 3).alignment = Alignment(horizontal="center", vertical="center")
         ws.cell(row, 4).alignment = Alignment(horizontal="center", vertical="center")
         ws.cell(row, 5).alignment = Alignment(horizontal="center", vertical="center")
         ws.cell(row, 6).alignment = Alignment(horizontal="center", vertical="center")
-        ws.cell(row, 7).alignment = Alignment(horizontal="center", vertical="center")
 
         fill, font = status_styles.get(r["status"], status_styles["Manual Review"])
-        status_cell = ws.cell(row, 8)
+        status_cell = ws.cell(row, 7)
         status_cell.fill = fill
         status_cell.font = font
         status_cell.alignment = Alignment(horizontal="center", vertical="center")
 
+        if has_reason:
+            ws.cell(row, 8).alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+        if has_figures:
+            fc = 8 + int(has_reason)   # column where "Image Figs" starts
+            ws.cell(row, fc).alignment     = Alignment(horizontal="center", vertical="center")
+            ws.cell(row, fc+1).alignment   = Alignment(horizontal="left",   vertical="top", wrap_text=True)
+            ws.cell(row, fc+2).alignment   = Alignment(horizontal="left",   vertical="top", wrap_text=True)
+            fm_cell = ws.cell(row, fc+3)
+            fm_cell.alignment = Alignment(horizontal="center", vertical="center")
+            fm = r.get("figures_match")
+            if fm is not None:
+                fm_fill, fm_font = fig_match_styles[fm]
+                fm_cell.fill = fm_fill
+                fm_cell.font = fm_font
+
     ws.column_dimensions['A'].width = 6
-    ws.column_dimensions['B'].width = 55
-    ws.column_dimensions['C'].width = 55
+    ws.column_dimensions['B'].width = 65
+    ws.column_dimensions['C'].width = 18
     ws.column_dimensions['D'].width = 18
-    ws.column_dimensions['E'].width = 18
-    ws.column_dimensions['F'].width = 12
-    ws.column_dimensions['G'].width = 10
-    ws.column_dimensions['H'].width = 22
+    ws.column_dimensions['E'].width = 12
+    ws.column_dimensions['F'].width = 10
+    ws.column_dimensions['G'].width = 22
+    if has_reason:
+        ws.column_dimensions['H'].width = 50
+    if has_figures:
+        fc = 8 + int(has_reason)
+        ws.column_dimensions[get_column_letter(fc)].width   = 12
+        ws.column_dimensions[get_column_letter(fc+1)].width = 30
+        ws.column_dimensions[get_column_letter(fc+2)].width = 30
+        ws.column_dimensions[get_column_letter(fc+3)].width = 12
 
     wb.save(output_path)
 
