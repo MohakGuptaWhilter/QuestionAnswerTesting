@@ -1,20 +1,27 @@
-# QA Testing System
+# QA PDF Extractor API
 
-A Flask API + React frontend for extracting questions and answers from PDF documents and evaluating them against a knowledge base API.
+A Flask API for extracting questions and answers from exam PDFs using vision models, with validation support.
 
 ## Project Structure
 
 ```
 qa_test/
-├── api.py                  # Flask API (entry point)
-├── frontend/               # React frontend
+├── api.py                    # Flask API — routes only
+├── src/
+│   ├── vision.py             # Ollama (local) vision backend + model dispatcher
+│   ├── claude_vision.py      # Anthropic Claude vision backend
+│   ├── gpt_vision.py         # OpenAI GPT vision backend
+│   ├── mathpix.py            # Mathpix OCR backend
+│   ├── pdf_utils.py          # PDF → PNG cropping, figure extraction, question mapping
+│   ├── pdf_processor.py      # PDF text extraction and Q&A parsing
+│   ├── quickstart.py         # LandingAI PDF parsing client
+│   └── helpers.py            # Shared utilities: sanitize, latex_to_unicode, Excel builders
+├── questions/                # Per-question crop images (generated at runtime)
+├── figures/                  # Extracted figure images (generated at runtime)
+├── frontend/
 │   └── src/
 │       └── components/
 │           └── PDFUploader.jsx
-├── src/
-│   ├── pdf_processor.py    # PDF text extraction and parsing
-│   ├── quickstart.py       # LandingAI PDF parsing client
-│   └── helpers.py          # Shared utilities (sanitize, search API, Excel builders)
 ├── tests/
 │   └── test_qa_system.py
 └── requirements.txt
@@ -25,53 +32,77 @@ qa_test/
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Health check |
-| POST | `/api/extract` | Extract Q&A from two PDFs → Excel download |
-| POST | `/api/evaluate` | Extract Q&A from two PDFs, evaluate via search API → Excel download |
-| POST | `/api/evaluate-excel` | Evaluate Q&A from an existing Excel file via search API → Excel download |
-| POST | `/api/clean-excel` | Strip noise from the Question column of an Excel file → Excel download |
+| POST | `/api/extract` | Extract Q&A from two PDFs via LandingAI → Excel |
+| POST | `/api/pdf-to-images` | Crop each question to an image, run vision model → Excel |
+| POST | `/api/extract-mathpix` | Crop each question to an image, run Mathpix OCR → Excel |
+| POST | `/api/validate` | Validate an existing Excel Q&A sheet against the source PDFs → Excel |
 
-### Request formats
+### `/api/pdf-to-images` — `multipart/form-data`
 
-**`/api/extract` and `/api/evaluate`** — `multipart/form-data`
-- `questions_pdf` (file, required)
-- `answers_pdf` (file, required)
-- `agent_id` (string, evaluate only)
-- `deployment_slug` (string, evaluate only)
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `questions_pdf` | file | yes | PDF of exam questions |
+| `answers_pdf` | file | yes | PDF of answer key |
+| `model` | string | no | Vision model to use (default: `qwen2.5vl:7b`) |
 
-**`/api/evaluate-excel` and `/api/clean-excel`** — `multipart/form-data`
-- `qa_excel` (file, required) — `.xlsx` produced by `/api/extract`
-- `agent_id` (string, evaluate-excel only)
-- `deployment_slug` (string, evaluate-excel only)
+**Supported `model` values:**
+
+| Value | Backend | Notes |
+|-------|---------|-------|
+| `qwen2.5vl:7b` | Ollama (local) | Default — requires Ollama running on port 11434 |
+| `haiku` | Anthropic Claude | `claude-haiku-4-5-20251001` — fast, lower cost |
+| `sonnet` | Anthropic Claude | `claude-sonnet-4-6` — best accuracy for complex math/chemistry |
+| `gpt-4o` | OpenAI | Best OpenAI vision model |
+| `gpt-4o-mini` | OpenAI | Faster, lower cost OpenAI option |
+| Any full model ID | Auto-detected | e.g. `claude-sonnet-4-6`, `gpt-4o-mini` |
+
+### `/api/extract-mathpix` — `multipart/form-data`
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `questions_pdf` | file | yes | PDF of exam questions |
+| `answers_pdf` | file | yes | PDF of answer key |
+| `model` | string | no | Mathpix model: `text` (default) or `latex` |
+
+### `/api/validate` — `multipart/form-data`
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `questions_pdf` | file | yes | Source-of-truth questions PDF |
+| `answers_pdf` | file | yes | Source-of-truth answer key PDF |
+| `excel` | file | yes | `.xlsx` to validate (must have `question_number`, `question_text`, `answer` columns) |
 
 ## Installation
 
 ```bash
 python3 -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+source venv/bin/activate       # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+### Environment variables
+
+| Variable | Required for |
+|----------|-------------|
+| `ANTHROPIC_API_KEY` | `model=haiku` / `model=sonnet` |
+| `OPENAI_API_KEY` | `model=gpt-4o` / `model=gpt-4o-mini` |
+
+For local Ollama, no API key is needed — just have `ollama serve` running.
+
 ## Running
 
-**Backend**
 ```bash
 python api.py
 # Runs on http://localhost:5000
 ```
 
-**Frontend**
-```bash
-cd frontend
-npm install
-npm run dev
-# Runs on http://localhost:5173
-```
-
 ## Dependencies
 
 - **Flask** — API server
-- **openpyxl** — Excel file creation and manipulation
-- **PyMuPDF / PyPDF2** — PDF text extraction
-- **landingai-ade** — LandingAI document parsing (questions PDF)
-- **requests** — HTTP calls to the external search API
-- **python-dotenv** — Environment variable management
+- **PyMuPDF** — PDF rendering and text extraction
+- **openpyxl** / **pandas** — Excel I/O
+- **anthropic** — Anthropic Claude API (optional, for Claude models)
+- **openai** — OpenAI API (optional, for GPT models)
+- **requests** — Ollama HTTP calls
+- **rapidfuzz** — Answer similarity scoring in validation
+- **landingai-ade** — LandingAI document parsing (`/api/extract`)

@@ -4,6 +4,14 @@ import requests
 _OLLAMA_URL   = "http://localhost:11434/api/chat"
 _VISION_MODEL = "qwen2.5vl:7b"
 
+# Short aliases accepted in the model form field
+_MODEL_ALIASES = {
+    "haiku":      "claude-haiku-4-5-20251001",
+    "sonnet":     "claude-sonnet-4-6",
+    "gpt-4o":     "gpt-4o",
+    "gpt-4o-mini": "gpt-4o-mini",
+}
+
 _VISION_PROMPT_TEMPLATE = """\
 You are an expert exam question extractor.
 
@@ -65,3 +73,15 @@ def call_vision_model(image_path: str, figure_count: int = 0) -> str:
     resp = requests.post(_OLLAMA_URL, json=payload, timeout=120)
     resp.raise_for_status()
     return resp.json()["message"]["content"].strip()
+
+
+def call_vision(image_path: str, figure_count: int = 0, model: str = _VISION_MODEL) -> str:
+    """Route to the correct vision backend based on the model name or alias."""
+    resolved = _MODEL_ALIASES.get(model, model)
+    if resolved.startswith("claude"):
+        from src.claude_vision import call_vision_model_claude
+        return call_vision_model_claude(image_path, figure_count, resolved)
+    if resolved.startswith("gpt") or resolved.startswith("o1") or resolved.startswith("o3"):
+        from src.gpt_vision import call_vision_model_gpt
+        return call_vision_model_gpt(image_path, figure_count, resolved)
+    return call_vision_model(image_path, figure_count)  # Ollama (default)

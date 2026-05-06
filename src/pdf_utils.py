@@ -184,6 +184,17 @@ def extract_figures_per_question(pdf_path: str, output_base_dir: str) -> dict:
     return q_figures
 
 
+def _content_bottom(page, y_start: float, y_limit: float) -> float:
+    """Return the y-bottom of the last content block (text or image) whose top
+    falls in [y_start, y_limit).  Returns y_start when no blocks are found."""
+    bottom = y_start
+    for block in page.get_text("blocks"):
+        if block[1] < y_start or block[1] >= y_limit:
+            continue
+        bottom = max(bottom, block[3])
+    return bottom
+
+
 def crop_questions_from_pdf(pdf_path: str, output_dir: str) -> dict:
     """Detect question boundaries via sequential numbered patterns and crop each
     question region to its own PNG file.
@@ -224,18 +235,22 @@ def crop_questions_from_pdf(pdf_path: str, output_dir: str) -> dict:
         page = doc[page_idx]
         page_rect = page.rect
 
+        # y_limit: hard upper boundary — the start of the next question (or page bottom).
+        # Used only to scope the content search; the actual crop bottom is tighter.
         if q_idx + 1 < len(markers):
             next_q_num, next_page_idx, next_y = markers[q_idx + 1]
-            y_bottom = next_y if next_page_idx == page_idx else page_rect.height
+            y_limit = next_y if next_page_idx == page_idx else page_rect.height
         else:
-            y_bottom = page_rect.height
+            y_limit = page_rect.height
 
         x0 = 0.0
-        # For the first question, start from the top of the page so any figure
-        # positioned above the question marker (e.g. a reference diagram) is included.
-        y0 = 0.0 if q_idx == 0 else max(0.0, y_top - 5)
+        y0 = max(0.0, y_top - 5)
         x1 = page_rect.width
-        y1 = min(page_rect.height, y_bottom)
+
+        # Tighten the bottom to the last content block (text or image) so the
+        # crop contains only the question + options, not the gap before the next question.
+        raw_bottom = _content_bottom(page, y_top, y_limit)
+        y1 = min(page_rect.height, raw_bottom + 5)
 
         if y1 - y0 < 1 or x1 - x0 < 1:
             continue

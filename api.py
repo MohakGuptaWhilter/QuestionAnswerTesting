@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
 from flask import Flask, request, send_file, jsonify
 from werkzeug.utils import secure_filename
@@ -23,11 +24,11 @@ from src.helpers import (
     latex_to_unicode, FIGURE_URL_RE, FIG_FONT, inline_fig_labels,
 )
 from src.pdf_utils import (
-    pdf_pages_to_png, extract_figures_from_pdf,
+    extract_figures_from_pdf,
     build_question_mapping, crop_questions_from_pdf,
     extract_figures_per_question,
 )
-from src.vision import call_vision_model
+from src.vision import call_vision
 from src.mathpix import call_mathpix
 
 app = Flask(__name__)
@@ -39,6 +40,8 @@ MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 
+
+_VISION_MAX_WORKERS = 8
 
 _VLM_VALIDATE_URL   = "http://localhost:11434/api/chat"
 _VLM_VALIDATE_MODEL = "qwen2.5vl:7b"
@@ -395,6 +398,74 @@ def extract_qa():
 #             pass
 
 
+def _prepare_work_dirs(base_dir: str) -> tuple:
+    questions_dir = os.path.join(base_dir, 'questions')
+    figures_dir   = os.path.join(base_dir, 'figures')
+    os.makedirs(questions_dir, exist_ok=True)
+    os.makedirs(figures_dir, exist_ok=True)
+    return questions_dir, figures_dir
+
+
+def _run_pdf_pipeline(questions_path: str, answers_path: str,
+                      questions_dir: str, figures_dir: str) -> tuple:
+    crop_by_qnum = crop_questions_from_pdf(questions_path, questions_dir)
+    fig_data     = extract_figures_from_pdf(questions_path, figures_dir)
+    mapping      = build_question_mapping(questions_path, answers_path, fig_data)
+    return crop_by_qnum, mapping
+
+
+def _transcribe_entry(entry: dict, crop_by_qnum: dict, model: str) -> dict:
+    crop_path = crop_by_qnum.get(entry["question_num"])
+    figs = entry.get("figure") or []
+    if crop_path and os.path.exists(crop_path):
+        try:
+            q_text = call_vision(crop_path, figure_count=len(figs), model=model)
+        except Exception as exc:
+            q_text = f"[vision error: {exc}]"
+    else:
+        q_text = ""
+    return {
+        "question_num":  str(entry["question_num"]),
+        "question_text": sanitize(latex_to_unicode(q_text)),
+        "answers":       sanitize(latex_to_unicode(entry.get("answer", "N/A") or "N/A")),
+        "figures":       ", ".join(os.path.basename(p) for p in figs),
+    }
+
+
+def _transcribe_all_parallel(mapping: list, crop_by_qnum: dict, model: str) -> list:
+    with ThreadPoolExecutor(max_workers=_VISION_MAX_WORKERS) as executor:
+        futures = [executor.submit(_transcribe_entry, entry, crop_by_qnum, model) for entry in mapping]
+    return [f.result() for f in futures]
+
+
+def _write_questions_excel(result: list, output_path: str) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Questions"
+
+    ws.append(["question_num", "question_text", "figures", "answers"])
+    header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for entry in result:
+        ws.append([entry["question_num"], entry["question_text"], entry["figures"], entry["answers"]])
+        row = ws.max_row
+        ws.cell(row, 1).alignment = Alignment(horizontal="center", vertical="top")
+        ws.cell(row, 2).alignment = Alignment(horizontal="left",   vertical="top", wrap_text=True)
+        ws.cell(row, 3).alignment = Alignment(horizontal="left",   vertical="top", wrap_text=True)
+        ws.cell(row, 4).alignment = Alignment(horizontal="center", vertical="center")
+
+    ws.column_dimensions['A'].width = 14
+    ws.column_dimensions['B'].width = 70
+    ws.column_dimensions['C'].width = 35
+    ws.column_dimensions['D'].width = 18
+    wb.save(output_path)
+
+
 @app.route('/api/pdf-to-images', methods=['POST'])
 def pdf_to_images():
     questions_path = None
@@ -404,6 +475,7 @@ def pdf_to_images():
         if not is_valid:
             return jsonify({"error": error_msg}), 400
 
+        model          = request.form.get("model", "qwen2.5vl:7b")
         questions_file = request.files['questions_pdf']
         answers_file   = request.files['answers_pdf']
 
@@ -412,66 +484,14 @@ def pdf_to_images():
         questions_file.save(questions_path)
         answers_file.save(answers_path)
 
-        base_dir      = os.getcwd()
-        pages_dir     = os.path.join(base_dir, 'pages')
-        questions_dir = os.path.join(base_dir, 'questions')
-        figures_dir   = os.path.join(base_dir, 'figures')
-        os.makedirs(pages_dir, exist_ok=True)
-        os.makedirs(questions_dir, exist_ok=True)
-        os.makedirs(figures_dir, exist_ok=True)
-
-        pdf_pages_to_png(questions_path, pages_dir, prefix='questions')
-        pdf_pages_to_png(answers_path,   pages_dir, prefix='answers')
-        crop_by_qnum = crop_questions_from_pdf(questions_path, questions_dir)
-        fig_data     = extract_figures_from_pdf(questions_path, figures_dir)
-        mapping      = build_question_mapping(questions_path, answers_path, fig_data)
-
-        result = []
-        for entry in mapping:
-            crop_path = crop_by_qnum.get(entry["question_num"])
-            figs = entry.get("figure") or []
-            if crop_path and os.path.exists(crop_path):
-                try:
-                    q_text = call_vision_model(crop_path, figure_count=len(figs))
-                except Exception as vision_err:
-                    q_text = f"[vision error: {vision_err}]"
-            else:
-                q_text = ""
-
-            result.append({
-                "question_num":  str(entry["question_num"]),
-                "question_text": sanitize(latex_to_unicode(q_text)),
-                "answers":       sanitize(latex_to_unicode(entry.get("answer", "N/A") or "N/A")),
-                "figures":       ", ".join(os.path.basename(p) for p in figs),
-            })
-
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Questions"
-
-        ws.append(["question_num", "question_text", "figures", "answers"])
-        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-        header_font = Font(color="FFFFFF", bold=True)
-        for cell in ws[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-        for entry in result:
-            ws.append([entry["question_num"], entry["question_text"], entry["figures"], entry["answers"]])
-            row = ws.max_row
-            ws.cell(row, 1).alignment = Alignment(horizontal="center", vertical="top")
-            ws.cell(row, 2).alignment = Alignment(horizontal="left",   vertical="top", wrap_text=True)
-            ws.cell(row, 3).alignment = Alignment(horizontal="left",   vertical="top", wrap_text=True)
-            ws.cell(row, 4).alignment = Alignment(horizontal="center", vertical="center")
-
-        ws.column_dimensions['A'].width = 14
-        ws.column_dimensions['B'].width = 70
-        ws.column_dimensions['C'].width = 35
-        ws.column_dimensions['D'].width = 18
+        questions_dir, figures_dir = _prepare_work_dirs(os.getcwd())
+        crop_by_qnum, mapping = _run_pdf_pipeline(
+            questions_path, answers_path, questions_dir, figures_dir,
+        )
+        result = _transcribe_all_parallel(mapping, crop_by_qnum, model)
 
         output_excel = os.path.join(app.config['UPLOAD_FOLDER'], 'questions_output.xlsx')
-        wb.save(output_excel)
+        _write_questions_excel(result, output_excel)
 
         return send_file(
             output_excel,
@@ -489,6 +509,33 @@ def pdf_to_images():
                     os.remove(path)
             except Exception:
                 pass
+
+
+def _transcribe_entry_mathpix(entry: dict, crop_by_qnum: dict, model: str) -> dict:
+    crop_path = crop_by_qnum.get(entry["question_num"])
+    figs = entry.get("figure") or []
+    if crop_path and os.path.exists(crop_path):
+        try:
+            q_text = call_mathpix(crop_path, model=model)
+        except Exception as exc:
+            q_text = f"[mathpix error: {exc}]"
+    else:
+        q_text = ""
+    return {
+        "question_num":  str(entry["question_num"]),
+        "question_text": sanitize(latex_to_unicode(q_text)),
+        "answers":       sanitize(latex_to_unicode(entry.get("answer", "N/A") or "N/A")),
+        "figures":       ", ".join(os.path.basename(p) for p in figs),
+    }
+
+
+def _transcribe_all_mathpix_parallel(mapping: list, crop_by_qnum: dict, model: str) -> list:
+    with ThreadPoolExecutor(max_workers=_VISION_MAX_WORKERS) as executor:
+        futures = [
+            executor.submit(_transcribe_entry_mathpix, entry, crop_by_qnum, model)
+            for entry in mapping
+        ]
+    return [f.result() for f in futures]
 
 
 @app.route('/api/extract-mathpix', methods=['POST'])
@@ -510,66 +557,14 @@ def extract_mathpix():
         questions_file.save(questions_path)
         answers_file.save(answers_path)
 
-        base_dir      = os.getcwd()
-        pages_dir     = os.path.join(base_dir, 'pages')
-        questions_dir = os.path.join(base_dir, 'questions')
-        figures_dir   = os.path.join(base_dir, 'figures')
-        os.makedirs(pages_dir, exist_ok=True)
-        os.makedirs(questions_dir, exist_ok=True)
-        os.makedirs(figures_dir, exist_ok=True)
-
-        pdf_pages_to_png(questions_path, pages_dir, prefix='questions')
-        pdf_pages_to_png(answers_path,   pages_dir, prefix='answers')
-        crop_by_qnum = crop_questions_from_pdf(questions_path, questions_dir)
-        fig_data     = extract_figures_from_pdf(questions_path, figures_dir)
-        mapping      = build_question_mapping(questions_path, answers_path, fig_data)
-
-        result = []
-        for entry in mapping:
-            crop_path = crop_by_qnum.get(entry["question_num"])
-            figs = entry.get("figure") or []
-            if crop_path and os.path.exists(crop_path):
-                try:
-                    q_text = call_mathpix(crop_path, model=model)
-                except Exception as mathpix_err:
-                    q_text = f"[mathpix error: {mathpix_err}]"
-            else:
-                q_text = ""
-
-            result.append({
-                "question_num":  str(entry["question_num"]),
-                "question_text": sanitize(latex_to_unicode(q_text)),
-                "answers":       sanitize(latex_to_unicode(entry.get("answer", "N/A") or "N/A")),
-                "figures":       ", ".join(os.path.basename(p) for p in figs),
-            })
-
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Questions"
-
-        ws.append(["question_num", "question_text", "figures", "answers"])
-        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-        header_font = Font(color="FFFFFF", bold=True)
-        for cell in ws[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-        for entry in result:
-            ws.append([entry["question_num"], entry["question_text"], entry["figures"], entry["answers"]])
-            row = ws.max_row
-            ws.cell(row, 1).alignment = Alignment(horizontal="center", vertical="top")
-            ws.cell(row, 2).alignment = Alignment(horizontal="left",   vertical="top", wrap_text=True)
-            ws.cell(row, 3).alignment = Alignment(horizontal="left",   vertical="top", wrap_text=True)
-            ws.cell(row, 4).alignment = Alignment(horizontal="center", vertical="center")
-
-        ws.column_dimensions['A'].width = 14
-        ws.column_dimensions['B'].width = 70
-        ws.column_dimensions['C'].width = 35
-        ws.column_dimensions['D'].width = 18
+        questions_dir, figures_dir = _prepare_work_dirs(os.getcwd())
+        crop_by_qnum, mapping = _run_pdf_pipeline(
+            questions_path, answers_path, questions_dir, figures_dir,
+        )
+        result = _transcribe_all_mathpix_parallel(mapping, crop_by_qnum, model)
 
         output_excel = os.path.join(app.config['UPLOAD_FOLDER'], 'mathpix_output.xlsx')
-        wb.save(output_excel)
+        _write_questions_excel(result, output_excel)
 
         return send_file(
             output_excel,
