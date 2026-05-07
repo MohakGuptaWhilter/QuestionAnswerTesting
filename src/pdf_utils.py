@@ -3,7 +3,21 @@ import re
 import fitz  # PyMuPDF
 from src.pdf_processor import PDFProcessor
 
-_Q_PATTERN = re.compile(r'^\s*(?:Q\.?\s*)?(\d+)[.)]\s', re.IGNORECASE)
+_Q_PATTERN = re.compile(
+    r'^\s*(?:'
+    # Alternative 1 — Q / Question prefix present: delimiter is optional (Q1, Q1., Q.1, Q 1.)
+    r'Q(?:uestion)?\.?\s*\(?(\d{1,3})[\s.):,]?'
+    r'|'
+    # Alternative 2 — no prefix: require dot/paren + whitespace to avoid "45.4L" false match
+    r'\(?(\d{1,3})[.)]\s'
+    r')',
+    re.IGNORECASE,
+)
+
+
+def _parse_q_num(m) -> int:
+    """Return the question number from a _Q_PATTERN match (handles both alternatives)."""
+    return int(m.group(1) if m.group(1) is not None else m.group(2))
 _DPI = 150
 _MAT = fitz.Matrix(_DPI / 72, _DPI / 72)
 
@@ -72,7 +86,7 @@ def build_question_mapping(questions_path: str, answers_path: str, fig_data: lis
             m = _Q_PATTERN.match(first_line)
             if not m:
                 continue
-            num = int(m.group(1))
+            num = _parse_q_num(m)
             if expected_num is None or num == expected_num:
                 markers.append((num, page_idx, block[1]))
                 expected_num = num + 1
@@ -127,7 +141,7 @@ def extract_figures_per_question(pdf_path: str, output_base_dir: str) -> dict:
             m = _Q_PATTERN.match(first_line)
             if not m:
                 continue
-            num = int(m.group(1))
+            num = _parse_q_num(m)
             if expected_num is None or num == expected_num:
                 markers.append((num, page_idx, block[1]))
                 expected_num = num + 1
@@ -215,7 +229,7 @@ def crop_questions_from_pdf(pdf_path: str, output_dir: str) -> dict:
             m = _Q_PATTERN.match(first_line)
             if not m:
                 continue
-            num = int(m.group(1))
+            num = _parse_q_num(m)
             if expected_num is None or num == expected_num:
                 markers.append((num, page_idx, block[1]))
                 expected_num = num + 1
@@ -363,7 +377,7 @@ def map_figures_to_questions_on_pages(pdf_path: str, page_indices: list, fig_dat
             m = _Q_PATTERN.match(first_line)
             if not m:
                 continue
-            num = int(m.group(1))
+            num = _parse_q_num(m)
             if expected_num is None or num == expected_num:
                 markers.append((num, page_idx, block[1]))
                 expected_num = num + 1
@@ -389,6 +403,114 @@ def map_figures_to_questions_on_pages(pdf_path: str, page_indices: list, fig_dat
             q_figures[q_num].append(path)
 
     return q_figures
+
+
+def _content_bottom_in_col(page, y_start: float, y_limit: float,
+                            col_x0: float, col_x1: float) -> float:
+    """Like _content_bottom but only considers blocks that overlap the column x-range."""
+    bottom = y_start
+    for block in page.get_text("blocks"):
+        if block[1] < y_start or block[1] >= y_limit:
+            continue
+        if block[2] <= col_x0 or block[0] >= col_x1:   # no x overlap with column
+            continue
+        bottom = max(bottom, block[3])
+    return bottom
+
+
+def crop_questions_from_pages(pdf_path: str, page_indices: list,
+                               output_dir: str, prefix: str = "question",
+                               layout_by_page: dict = None) -> dict:
+    """Crop individual question/answer regions from specific pages to PNG files.
+
+    layout_by_page: {page_idx (0-based): "single_column" | "multi_column"}
+      For multi_column pages blocks are scanned left-column-first so that the
+      sequential expected_num check counts through the left column before moving
+      to the right column.  The x-range of each crop is restricted to the column
+      where its marker was found.
+
+    Returns {q_num: absolute_path}.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    layout_by_page = layout_by_page or {}
+    doc = fitz.open(pdf_path)
+    page_set = set(page_indices)
+
+    # markers: (q_num, page_idx, y_top, block_x0)
+    markers = []
+    expected_num = None
+
+    for page_idx in sorted(page_set):
+        if page_idx >= len(doc):
+            continue
+        page = doc[page_idx]
+        layout = layout_by_page.get(page_idx, "single_column")
+        text_blocks = [b for b in page.get_text("blocks") if b[6] == 0]
+
+        if layout == "multi_column":
+            mid_x = page.rect.width / 2
+            left_blocks  = sorted([b for b in text_blocks if b[0] <  mid_x], key=lambda b: (b[1], b[0]))
+            right_blocks = sorted([b for b in text_blocks if b[0] >= mid_x], key=lambda b: (b[1], b[0]))
+            ordered_blocks = left_blocks + right_blocks
+        else:
+            ordered_blocks = sorted(text_blocks, key=lambda b: (b[1], b[0]))
+
+        for block in ordered_blocks:
+            first_line = block[4].strip().split('\n')[0]
+            m = _Q_PATTERN.match(first_line)
+            if not m:
+                continue
+            num = _parse_q_num(m)
+            if expected_num is None or num == expected_num:
+                markers.append((num, page_idx, block[1], block[0]))
+                expected_num = num + 1
+
+    crops = {}
+    if not markers:
+        doc.close()
+        return crops
+
+    for q_idx, (q_num, page_idx, y_top, block_x0) in enumerate(markers):
+        page = doc[page_idx]
+        page_rect = page.rect
+        mid_x = page_rect.width / 2
+        layout = layout_by_page.get(page_idx, "single_column")
+
+        # Column x-range
+        if layout == "multi_column":
+            if block_x0 >= mid_x:
+                col_x0, col_x1 = mid_x, page_rect.width   # right column
+            else:
+                col_x0, col_x1 = 0.0, mid_x               # left column
+        else:
+            col_x0, col_x1 = 0.0, page_rect.width
+
+        # y_limit: next marker in the same column on the same page
+        y_limit = page_rect.height
+        if q_idx + 1 < len(markers):
+            _, np_idx, ny_top, nbx0 = markers[q_idx + 1]
+            if np_idx == page_idx:
+                if layout == "multi_column":
+                    if (nbx0 >= mid_x) == (block_x0 >= mid_x):   # same column
+                        y_limit = ny_top
+                else:
+                    y_limit = ny_top
+
+        y0 = max(0.0, y_top - 5)
+        raw_bottom = _content_bottom_in_col(page, y_top, y_limit, col_x0, col_x1)
+        y1 = min(page_rect.height, raw_bottom + 8)
+
+        if y1 - y0 < 1 or col_x1 - col_x0 < 1:
+            continue
+
+        clip = fitz.Rect(col_x0, y0, col_x1, y1)
+        pix = page.get_pixmap(matrix=_MAT, clip=clip)
+        out_path = os.path.join(output_dir, f"{prefix}_{q_num:03d}.png")
+        pix.save(out_path)
+        crops[q_num] = os.path.abspath(out_path)
+
+    doc.close()
+    return crops
 
 
 def detect_layout_fitz(pdf_path: str, page_index: int) -> dict:

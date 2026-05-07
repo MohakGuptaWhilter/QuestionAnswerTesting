@@ -29,6 +29,7 @@ from src.pdf_utils import (
     extract_figures_per_question,
     pdf_pages_to_png, save_page_crops, detect_layout_fitz,
     extract_figures_from_pages, map_figures_to_questions_on_pages,
+    crop_questions_from_pages,
 )
 from src.vision import call_vision
 from src.mathpix import call_mathpix
@@ -827,6 +828,29 @@ def general_purpose_extraction():
         )
         s_figure_map = map_figures_to_questions_on_pages(pdf_path, s_indices, s_fig_data)
 
+        # ── Individual question / answer crops ────────────────────────────────
+        q_layout = {
+            p["page"] - 1: (p["layout"]["type"] if p["layout"] else "single_column")
+            for p in results if p["page_type"] == "questions"
+        }
+        s_layout = {
+            p["page"] - 1: (p["layout"]["type"] if p["layout"] else "single_column")
+            for p in results if p["page_type"] == "solutions"
+        }
+
+        q_crops = crop_questions_from_pages(
+            pdf_path, q_indices,
+            os.path.join(os.getcwd(), "questions"),
+            prefix="question",
+            layout_by_page=q_layout,
+        )
+        s_crops = crop_questions_from_pages(
+            pdf_path, s_indices,
+            os.path.join(os.getcwd(), "solutions"),
+            prefix="answer",
+            layout_by_page=s_layout,
+        )
+
         return jsonify({
             "total_pages": len(results),
             "pages": results,
@@ -834,6 +858,8 @@ def general_purpose_extraction():
                 "questions": {str(k): v for k, v in q_figure_map.items()},
                 "solutions":  {str(k): v for k, v in s_figure_map.items()},
             },
+            "question_crops": {str(k): v for k, v in q_crops.items()},
+            "answer_crops":   {str(k): v for k, v in s_crops.items()},
         }), 200
 
     except Exception as e:
