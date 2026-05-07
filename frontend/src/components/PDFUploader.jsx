@@ -6,6 +6,7 @@ import PdfExtractor from './modes/PdfExtractor';
 import PdfToImages from './modes/PdfToImages';
 import MathpixExtractor from './modes/MathpixExtractor';
 import ValidateQA from './modes/ValidateQA';
+import GeneralPurposeExtraction from './modes/GeneralPurposeExtraction';
 import './PDFUploader.css';
 
 const PDFUploader = () => {
@@ -18,10 +19,13 @@ const PDFUploader = () => {
   // const [agentId, setAgentId] = useState('');
   // const [deploymentSlug, setDeploymentSlug] = useState('');
   const [mathpixModel, setMathpixModel] = useState('text');
+  const [ptiModel, setPtiModel] = useState('qwen2.5vl:7b');
+  const [singlePdf, setSinglePdf] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [success, setSuccess] = useState(false);
   const [pdfToImagesResult, setPdfToImagesResult] = useState(null);
+  const [generalPurposeResult, setGeneralPurposeResult] = useState(null);
 
   // ── Mode change handler ────────────────────────────────────────────────────
 
@@ -82,6 +86,7 @@ const PDFUploader = () => {
     setQuestionsPdf(null);
     setAnswersPdf(null);
     setExcelFile(null);
+    setSinglePdf(null);
     // setQaExcel(null);
   };
 
@@ -154,6 +159,7 @@ const PDFUploader = () => {
     const fd = new FormData();
     fd.append('questions_pdf', questionsPdf);
     fd.append('answers_pdf', answersPdf);
+    fd.append('model', ptiModel);
 
     const res = await fetch('/api/pdf-to-images', { method: 'POST', body: fd });
     if (!res.ok) {
@@ -161,6 +167,16 @@ const PDFUploader = () => {
       throw new Error(err.error || `Server error ${res.status}`);
     }
     triggerDownload(await res.blob(), 'questions_output.xlsx');
+  };
+
+  const handleGeneralPurposeExtraction = async () => {
+    const fd = new FormData();
+    fd.append('pdf', singlePdf);
+
+    const res = await fetch('/api/general-purpose-extraction', { method: 'POST', body: fd });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Server error ${res.status}`);
+    setGeneralPurposeResult(data);
   };
 
   const handleValidate = async () => {
@@ -202,6 +218,10 @@ const PDFUploader = () => {
       setError('Please select both PDF files and the Excel sheet.');
       return;
     }
+    if (mode === 'general-purpose' && !singlePdf) {
+      setError('Please select a PDF file.');
+      return;
+    }
     // if ((mode === 'evaluate-excel' || mode === 'clean-excel') && !qaExcel) {
     //   setError('Please select an Excel file.');
     //   return;
@@ -221,12 +241,15 @@ const PDFUploader = () => {
       else if (mode === 'pdf-to-images') await handlePdfToImages();
       else if (mode === 'mathpix') await handleMathpixExtract();
       else if (mode === 'validate') await handleValidate();
+      else if (mode === 'general-purpose') await handleGeneralPurposeExtraction();
       // else if (mode === 'evaluate') await handleEvaluate();
       // else if (mode === 'evaluate-excel') await handleEvaluateExcel();
       // else if (mode === 'clean-excel') await handleCleanExcel();
 
-      setSuccess(true);
-      resetInputs();
+      if (mode !== 'general-purpose') {
+        setSuccess(true);
+        resetInputs();
+      }
     } catch (err) {
       setError(err.message || 'An unexpected error occurred.');
     } finally {
@@ -241,6 +264,8 @@ const PDFUploader = () => {
       ? !!(questionsPdf && answersPdf)
       : mode === 'validate'
       ? !!(questionsPdf && answersPdf && excelFile)
+      : mode === 'general-purpose'
+      ? !!singlePdf
       // : mode === 'evaluate'
       // ? questionsPdf && answersPdf && agentId.trim() && deploymentSlug.trim()
       // : mode === 'clean-excel'
@@ -274,6 +299,7 @@ const PDFUploader = () => {
         <PdfToImages
           questionsPdf={questionsPdf}
           answersPdf={answersPdf}
+          model={ptiModel}
           loading={loading}
           error={error}
           success={success}
@@ -282,6 +308,7 @@ const PDFUploader = () => {
             if (fileType === 'questions') handlePdfChange(e, setQuestionsPdf, label);
             else handlePdfChange(e, setAnswersPdf, label);
           }}
+          onModelChange={setPtiModel}
           onSubmit={handleSubmit}
           canSubmit={canSubmit}
         />
@@ -300,6 +327,18 @@ const PDFUploader = () => {
             else handlePdfChange(e, setAnswersPdf, label);
           }}
           onExcelChange={handleExcelChange}
+          onSubmit={handleSubmit}
+          canSubmit={canSubmit}
+        />
+      )}
+
+      {mode === 'general-purpose' && (
+        <GeneralPurposeExtraction
+          singlePdf={singlePdf}
+          loading={loading}
+          error={error}
+          result={generalPurposeResult}
+          onPdfChange={(e) => handlePdfChange(e, setSinglePdf, 'PDF')}
           onSubmit={handleSubmit}
           canSubmit={canSubmit}
         />

@@ -2,14 +2,24 @@ import React, { useRef } from 'react';
 import '../common/FileInputGroup.css';
 import './PdfToImages.css';
 
+const MODEL_OPTIONS = [
+  { value: 'qwen2.5vl:7b',             label: 'Qwen2.5-VL 7B (local / Ollama)' },
+  { value: 'gpt-4o-mini',              label: 'GPT-4o-mini (fast, cheap)' },
+  { value: 'gpt-4o',                   label: 'GPT-4o (best accuracy)' },
+  { value: 'claude-haiku-4-5-20251001', label: 'Claude Haiku (fast)' },
+  { value: 'claude-sonnet-4-6',        label: 'Claude Sonnet (accurate)' },
+];
+
 const PdfToImages = ({
   questionsPdf,
   answersPdf,
+  model,
   loading,
   error,
   success,
   result,
   onPdfChange,
+  onModelChange,
   onSubmit,
   canSubmit,
 }) => {
@@ -58,6 +68,21 @@ const PdfToImages = ({
             {answersPdf.name} ({(answersPdf.size / 1024).toFixed(1)} KB)
           </div>
         )}
+      </div>
+
+      <div className="file-input-group">
+        <label htmlFor="pti-model">Vision Model</label>
+        <select
+          id="pti-model"
+          value={model}
+          onChange={(e) => onModelChange(e.target.value)}
+          disabled={loading}
+          className="model-select"
+        >
+          {MODEL_OPTIONS.map((opt) => (
+            <option key={opt.value} value={opt.value}>{opt.label}</option>
+          ))}
+        </select>
       </div>
 
       {error && <div className="error-message">{error}</div>}
