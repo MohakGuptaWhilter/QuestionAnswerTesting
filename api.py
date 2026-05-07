@@ -29,9 +29,9 @@ from src.pdf_utils import (
     extract_figures_per_question,
     pdf_pages_to_png, save_page_crops, detect_layout_fitz,
     extract_figures_from_pages, map_figures_to_questions_on_pages,
-    crop_questions_from_pages,
 )
-from src.vision import call_vision
+from src.crop_questions_hybrid import crop_questions_from_page_images
+from src.vision import call_vision, _MODEL_ALIASES
 from src.mathpix import call_mathpix
 from src.page_classifier import classify_page_with_gpt
 
@@ -437,7 +437,9 @@ def _transcribe_entry(entry: dict, crop_by_qnum: dict, model: str) -> dict:
 
 
 def _transcribe_all_parallel(mapping: list, crop_by_qnum: dict, model: str) -> list:
-    with ThreadPoolExecutor(max_workers=_VISION_MAX_WORKERS) as executor:
+    resolved = model if not model.startswith("claude") else model
+    workers = 3 if resolved.startswith("claude") else _VISION_MAX_WORKERS
+    with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(_transcribe_entry, entry, crop_by_qnum, model) for entry in mapping]
     return [f.result() for f in futures]
 
@@ -535,10 +537,8 @@ def _transcribe_entry_mathpix(entry: dict, crop_by_qnum: dict, model: str) -> di
 
 def _transcribe_all_mathpix_parallel(mapping: list, crop_by_qnum: dict, model: str) -> list:
     with ThreadPoolExecutor(max_workers=_VISION_MAX_WORKERS) as executor:
-        futures = [
-            executor.submit(_transcribe_entry_mathpix, entry, crop_by_qnum, model)
-            for entry in mapping
-        ]
+        futures = [executor.submit(_transcribe_entry_mathpix, entry, crop_by_qnum, model)
+                   for entry in mapping]
     return [f.result() for f in futures]
 
 
@@ -764,6 +764,23 @@ def validate_qa():
                 pass
 
 
+def _transcribe_crops_parallel(crops: dict, figure_map: dict, model: str) -> dict:
+    """Transcribe a {q_num: image_path} dict via VLM. Returns {q_num: text}."""
+    resolved = _MODEL_ALIASES.get(model, model)
+    workers = 3 if resolved.startswith("claude") else _VISION_MAX_WORKERS
+
+    def _do(q_num, path):
+        figs = figure_map.get(q_num) or []
+        try:
+            return q_num, call_vision(path, figure_count=len(figs), model=model)
+        except Exception as exc:
+            return q_num, f"[vision error: {exc}]"
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_do, q_num, path): q_num for q_num, path in crops.items()}
+    return {q_num: fut.result()[1] for fut, q_num in [(f, futures[f]) for f in futures]}
+
+
 @app.route('/api/general-purpose-extraction', methods=['POST'])
 def general_purpose_extraction():
     """Classify each page of an uploaded PDF as theory, questions, solutions, or misc."""
@@ -777,6 +794,7 @@ def general_purpose_extraction():
         if not pdf_file.filename or not pdf_file.filename.lower().endswith('.pdf'):
             return jsonify({"error": "Uploaded file must be a PDF"}), 400
 
+        model    = request.form.get("model", "qwen2.5vl:7b")
         pdf_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(pdf_file.filename))
         pdf_file.save(pdf_path)
 
@@ -838,32 +856,57 @@ def general_purpose_extraction():
             for p in results if p["page_type"] == "solutions"
         }
 
-        q_crops = crop_questions_from_pages(
+        q_crops = crop_questions_from_page_images(
             pdf_path, q_indices,
-            os.path.join(os.getcwd(), "questions"),
-            prefix="question",
+            os.path.join(os.getcwd(), "question_images"),
+            prefix="question_images",
             layout_by_page=q_layout,
         )
-        s_crops = crop_questions_from_pages(
+        s_crops = crop_questions_from_page_images(
             pdf_path, s_indices,
-            os.path.join(os.getcwd(), "solutions"),
-            prefix="answer",
+            os.path.join(os.getcwd(), "solution_images"),
+            prefix="answer_images",
             layout_by_page=s_layout,
         )
 
-        return jsonify({
-            "total_pages": len(results),
-            "pages": results,
-            "figure_mapping": {
-                "questions": {str(k): v for k, v in q_figure_map.items()},
-                "solutions":  {str(k): v for k, v in s_figure_map.items()},
-            },
-            "question_crops": {str(k): v for k, v in q_crops.items()},
-            "answer_crops":   {str(k): v for k, v in s_crops.items()},
-        }), 200
+        # ── VLM transcription ─────────────────────────────────────────────────
+        q_texts = _transcribe_crops_parallel(q_crops, q_figure_map, model)
+        s_texts = _transcribe_crops_parallel(s_crops, s_figure_map, model)
+
+        excel_rows = [
+            {
+                "question_num":  str(q_num),
+                "question_text": sanitize(latex_to_unicode(q_texts.get(q_num, ""))),
+                "figures":       ", ".join(os.path.basename(p) for p in (q_figure_map.get(q_num) or [])),
+                "answers":       sanitize(latex_to_unicode(s_texts.get(q_num, ""))),
+            }
+            for q_num in sorted(set(q_texts) | set(s_texts))
+        ]
+
+        output_excel = os.path.join(app.config['UPLOAD_FOLDER'], 'general_extraction_output.xlsx')
+        _write_questions_excel(excel_rows, output_excel)
+
+        return send_file(
+            output_excel,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name='general_extraction_output.xlsx',
+        )
 
     except Exception as e:
         return jsonify({"error": f"Processing error: {str(e)}"}), 500
+    finally:
+        import shutil
+        if pdf_path and os.path.exists(pdf_path):
+            try:
+                os.remove(pdf_path)
+            except Exception:
+                pass
+        if tmp_dir and os.path.exists(tmp_dir):
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':

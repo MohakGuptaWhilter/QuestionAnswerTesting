@@ -34,3 +34,6 @@ venv.bak/
 output/
 .vscode/
 questions/
+question_images/
+figures/
+solution_images/

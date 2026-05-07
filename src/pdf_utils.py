@@ -1,5 +1,6 @@
 import os
 import re
+import numpy as np
 import fitz  # PyMuPDF
 from src.pdf_processor import PDFProcessor
 
@@ -8,8 +9,10 @@ _Q_PATTERN = re.compile(
     # Alternative 1 — Q / Question prefix present: delimiter is optional (Q1, Q1., Q.1, Q 1.)
     r'Q(?:uestion)?\.?\s*\(?(\d{1,3})[\s.):,]?'
     r'|'
-    # Alternative 2 — no prefix: require dot/paren + whitespace to avoid "45.4L" false match
-    r'\(?(\d{1,3})[.)]\s'
+    # Alternative 2 — no prefix: dot/paren must be followed by whitespace OR end-of-string.
+    # The end-of-string branch handles "1." alone on its own line (no trailing space).
+    # The positive lookahead for a non-digit after [.)] prevents matching decimals like "45.4".
+    r'\(?(\d{1,3})[.)](?=\s|$)'
     r')',
     re.IGNORECASE,
 )
@@ -418,6 +421,195 @@ def _content_bottom_in_col(page, y_start: float, y_limit: float,
     return bottom
 
 
+def _detect_col_split(page) -> float:
+    """Return the x-coordinate of the gutter between the two columns.
+
+    Rounds block x0 values to 5 px bins, then finds the largest gap in the
+    central 20 %–80 % zone of the page.  Falls back to page midpoint when the
+    gap is too small to be meaningful (< 5 % of page width).
+    """
+    pw = page.rect.width
+    blocks = [b for b in page.get_text("blocks") if b[6] == 0 and len(b[4].strip()) > 10]
+    if not blocks:
+        return pw / 2
+
+    # Unique x0 positions, rounded to 5 px to merge near-identical column starts
+    x0s = sorted(set(round(b[0] / 5) * 5 for b in blocks))
+    central = [x for x in x0s if pw * 0.2 <= x <= pw * 0.8]
+    if len(central) < 2:
+        return pw / 2
+
+    best_gap, split = 0.0, pw / 2
+    for i in range(len(central) - 1):
+        gap = central[i + 1] - central[i]
+        if gap > best_gap:
+            best_gap = gap
+            split = (central[i] + central[i + 1]) / 2
+
+    return split if best_gap > pw * 0.05 else pw / 2
+
+
+def _col_split_visual(page) -> float:
+    """Detect the column gutter x-coordinate by rendering the page to a grayscale
+    image and applying a vertical projection profile.
+
+    The fraction of near-white pixels in each pixel-column is smoothed, then the
+    maximum inside the central 25 %–75 % zone is taken as the gutter.  Falls back
+    to page midpoint when no clear whitespace strip is found.
+    """
+    pw = page.rect.width
+    pix = page.get_pixmap(matrix=_MAT, colorspace=fitz.csGRAY)
+    gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width).astype(np.float32)
+
+    # Skip header (top 15 %) and footer (bottom 5 %)
+    h, w = gray.shape
+    content = gray[int(h * 0.15): int(h * 0.95), :]
+
+    # White-pixel fraction per vertical pixel-column (gutter = densest white strip)
+    white_frac = (content > 245).mean(axis=0)
+
+    # Smooth with a box filter ~3 % of image width to find a region, not a hairline
+    kernel = max(3, w // 30)
+    smoothed = np.convolve(white_frac, np.ones(kernel) / kernel, mode='same')
+
+    lo, hi = int(w * 0.25), int(w * 0.75)
+    peak_local = int(np.argmax(smoothed[lo:hi]))
+    peak_x_px = lo + peak_local
+
+    # Only trust the result when the peak is meaningfully white (≥ 60 % white)
+    if smoothed[peak_x_px] < 0.60:
+        return pw / 2
+
+    return peak_x_px * pw / w
+
+
+def _line_markers_from_page(page) -> list:
+    """Return [(line_text, x0, y0), ...] for every text line on the page.
+
+    Uses get_text('dict') so each line's bounding box is derived from its
+    individual spans — more precise than block-level coordinates.
+    """
+    lines = []
+    for block in page.get_text("dict")["blocks"]:
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            if not spans:
+                continue
+            text = "".join(s["text"] for s in spans).strip()
+            x0 = spans[0]["bbox"][0]
+            y0 = spans[0]["bbox"][1]
+            lines.append((text, x0, y0))
+    return lines
+
+
+def crop_questions_visual(pdf_path: str, page_indices: list,
+                           output_dir: str, prefix: str = "question",
+                           layout_by_page: dict = None) -> dict:
+    """Crop question/answer regions using visual column detection.
+
+    Replaces the text-block heuristic in crop_questions_from_pages with two
+    improvements:
+
+    1. Column gutter detection via rendered-image vertical projection
+       (_col_split_visual) — finds the actual whitespace strip between columns
+       regardless of how PDF text blocks are structured or whether column widths
+       are unequal.
+
+    2. Q-marker positions from line-level span bounding boxes (_line_markers_from_page)
+       — more precise y0 / x0 than the block's bounding box corner.
+
+    Same return format as crop_questions_from_pages: {q_num: absolute_path}.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    layout_by_page = layout_by_page or {}
+    doc = fitz.open(pdf_path)
+    page_set = set(page_indices)
+
+    markers = []        # (q_num, page_idx, y_top, x0)
+    expected_num = None
+    col_split_cache = {}  # page_idx -> gutter x in PDF coordinates
+
+    for page_idx in sorted(page_set):
+        if page_idx >= len(doc):
+            continue
+        page = doc[page_idx]
+        layout = layout_by_page.get(page_idx, "single_column")
+
+        if layout == "multi_column":
+            mid_x = _col_split_visual(page)
+            col_split_cache[page_idx] = mid_x
+        else:
+            mid_x = page.rect.width  # treat entire page as one column
+
+        # Get all text lines with per-span precision
+        all_lines = _line_markers_from_page(page)
+
+        # Sort left column first (by y), then right column (by y)
+        if layout == "multi_column":
+            left  = sorted([l for l in all_lines if l[1] <  mid_x], key=lambda l: (l[2], l[1]))
+            right = sorted([l for l in all_lines if l[1] >= mid_x], key=lambda l: (l[2], l[1]))
+            ordered = left + right
+        else:
+            ordered = sorted(all_lines, key=lambda l: (l[2], l[1]))
+
+        for text, x0, y0 in ordered:
+            m = _Q_PATTERN.match(text)
+            if not m:
+                continue
+            num = _parse_q_num(m)
+            if expected_num is None or num == expected_num:
+                markers.append((num, page_idx, y0, x0))
+                expected_num = num + 1
+
+    crops = {}
+    if not markers:
+        doc.close()
+        return crops
+
+    for q_idx, (q_num, page_idx, y_top, block_x0) in enumerate(markers):
+        page = doc[page_idx]
+        page_rect = page.rect
+        layout = layout_by_page.get(page_idx, "single_column")
+        mid_x = col_split_cache.get(page_idx, page_rect.width / 2)
+
+        if layout == "multi_column":
+            if block_x0 >= mid_x:
+                col_x0, col_x1 = mid_x, page_rect.width
+            else:
+                col_x0, col_x1 = 0.0, mid_x
+        else:
+            col_x0, col_x1 = 0.0, page_rect.width
+
+        # y_limit: top of the next marker in the same column on the same page
+        y_limit = page_rect.height
+        if q_idx + 1 < len(markers):
+            _, np_idx, ny_top, nbx0 = markers[q_idx + 1]
+            if np_idx == page_idx:
+                if layout == "multi_column":
+                    if (nbx0 >= mid_x) == (block_x0 >= mid_x):
+                        y_limit = ny_top
+                else:
+                    y_limit = ny_top
+
+        y0_crop = max(0.0, y_top - 5)
+        raw_bottom = _content_bottom_in_col(page, y_top, y_limit, col_x0, col_x1)
+        y1_crop = min(page_rect.height, raw_bottom + 8)
+
+        if y1_crop - y0_crop < 1 or col_x1 - col_x0 < 1:
+            continue
+
+        clip = fitz.Rect(col_x0, y0_crop, col_x1, y1_crop)
+        pix = page.get_pixmap(matrix=_MAT, clip=clip)
+        out_path = os.path.join(output_dir, f"{prefix}_{q_num:03d}.png")
+        pix.save(out_path)
+        crops[q_num] = os.path.abspath(out_path)
+
+    doc.close()
+    return crops
+
+
 def crop_questions_from_pages(pdf_path: str, page_indices: list,
                                output_dir: str, prefix: str = "question",
                                layout_by_page: dict = None) -> dict:
@@ -439,30 +631,34 @@ def crop_questions_from_pages(pdf_path: str, page_indices: list,
     # markers: (q_num, page_idx, y_top, block_x0)
     markers = []
     expected_num = None
+    col_split_cache = {}  # page_idx -> detected gutter x
 
     for page_idx in sorted(page_set):
         if page_idx >= len(doc):
             continue
         page = doc[page_idx]
         layout = layout_by_page.get(page_idx, "single_column")
-        text_blocks = [b for b in page.get_text("blocks") if b[6] == 0]
+
+        # Use line-level positions from get_text("dict") so Q-numbers found on any
+        # line of a block get the correct y coordinate, not just the block top.
+        all_lines = _line_markers_from_page(page)
 
         if layout == "multi_column":
-            mid_x = page.rect.width / 2
-            left_blocks  = sorted([b for b in text_blocks if b[0] <  mid_x], key=lambda b: (b[1], b[0]))
-            right_blocks = sorted([b for b in text_blocks if b[0] >= mid_x], key=lambda b: (b[1], b[0]))
-            ordered_blocks = left_blocks + right_blocks
+            mid_x = _detect_col_split(page)
+            col_split_cache[page_idx] = mid_x
+            left  = sorted([l for l in all_lines if l[1] <  mid_x], key=lambda l: (l[2], l[1]))
+            right = sorted([l for l in all_lines if l[1] >= mid_x], key=lambda l: (l[2], l[1]))
+            ordered_lines = left + right
         else:
-            ordered_blocks = sorted(text_blocks, key=lambda b: (b[1], b[0]))
+            ordered_lines = sorted(all_lines, key=lambda l: (l[2], l[1]))
 
-        for block in ordered_blocks:
-            first_line = block[4].strip().split('\n')[0]
-            m = _Q_PATTERN.match(first_line)
+        for text, x0, y0 in ordered_lines:
+            m = _Q_PATTERN.match(text)
             if not m:
                 continue
             num = _parse_q_num(m)
             if expected_num is None or num == expected_num:
-                markers.append((num, page_idx, block[1], block[0]))
+                markers.append((num, page_idx, y0, x0))
                 expected_num = num + 1
 
     crops = {}
@@ -473,8 +669,8 @@ def crop_questions_from_pages(pdf_path: str, page_indices: list,
     for q_idx, (q_num, page_idx, y_top, block_x0) in enumerate(markers):
         page = doc[page_idx]
         page_rect = page.rect
-        mid_x = page_rect.width / 2
         layout = layout_by_page.get(page_idx, "single_column")
+        mid_x = col_split_cache.get(page_idx, page_rect.width / 2)
 
         # Column x-range
         if layout == "multi_column":

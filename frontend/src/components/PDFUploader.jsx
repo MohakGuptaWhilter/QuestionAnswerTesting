@@ -20,6 +20,7 @@ const PDFUploader = () => {
   // const [deploymentSlug, setDeploymentSlug] = useState('');
   const [mathpixModel, setMathpixModel] = useState('text');
   const [ptiModel, setPtiModel] = useState('qwen2.5vl:7b');
+  const [gpModel, setGpModel] = useState('qwen2.5vl:7b');
   const [singlePdf, setSinglePdf] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -172,11 +173,14 @@ const PDFUploader = () => {
   const handleGeneralPurposeExtraction = async () => {
     const fd = new FormData();
     fd.append('pdf', singlePdf);
+    fd.append('model', gpModel);
 
     const res = await fetch('/api/general-purpose-extraction', { method: 'POST', body: fd });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || `Server error ${res.status}`);
-    setGeneralPurposeResult(data);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `Server error ${res.status}`);
+    }
+    triggerDownload(await res.blob(), 'general_extraction_output.xlsx');
   };
 
   const handleValidate = async () => {
@@ -246,10 +250,8 @@ const PDFUploader = () => {
       // else if (mode === 'evaluate-excel') await handleEvaluateExcel();
       // else if (mode === 'clean-excel') await handleCleanExcel();
 
-      if (mode !== 'general-purpose') {
-        setSuccess(true);
-        resetInputs();
-      }
+      setSuccess(true);
+      resetInputs();
     } catch (err) {
       setError(err.message || 'An unexpected error occurred.');
     } finally {
@@ -335,10 +337,12 @@ const PDFUploader = () => {
       {mode === 'general-purpose' && (
         <GeneralPurposeExtraction
           singlePdf={singlePdf}
+          model={gpModel}
           loading={loading}
           error={error}
           result={generalPurposeResult}
           onPdfChange={(e) => handlePdfChange(e, setSinglePdf, 'PDF')}
+          onModelChange={setGpModel}
           onSubmit={handleSubmit}
           canSubmit={canSubmit}
         />
