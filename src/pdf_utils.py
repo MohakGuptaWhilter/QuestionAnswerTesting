@@ -263,3 +263,40 @@ def crop_questions_from_pdf(pdf_path: str, output_dir: str) -> dict:
 
     doc.close()
     return crops
+
+
+def save_page_crops(pdf_path: str, page_index: int, layout_type: str,
+                    page_type: str, base_dir: str = ".") -> list:
+    """Render and save a page (or its left/right halves for multi-column) to disk.
+
+    Files are written to <base_dir>/questions/ or <base_dir>/solutions/.
+    Returns a list of saved absolute paths.
+    """
+    target_dir = os.path.join(base_dir, page_type)
+    os.makedirs(target_dir, exist_ok=True)
+
+    doc = fitz.open(pdf_path)
+    page = doc[page_index]
+    rect = page.rect
+    page_num = page_index + 1
+    saved = []
+
+    if layout_type == "multi_column":
+        mid_x = rect.width / 2
+        halves = [
+            ("left",  fitz.Rect(0,     0, mid_x,      rect.height)),
+            ("right", fitz.Rect(mid_x, 0, rect.width, rect.height)),
+        ]
+        for side, clip in halves:
+            pix = page.get_pixmap(matrix=_MAT, clip=clip)
+            path = os.path.join(target_dir, f"page_{page_num:03d}_{side}.png")
+            pix.save(path)
+            saved.append(os.path.abspath(path))
+    else:
+        pix = page.get_pixmap(matrix=_MAT)
+        path = os.path.join(target_dir, f"page_{page_num:03d}.png")
+        pix.save(path)
+        saved.append(os.path.abspath(path))
+
+    doc.close()
+    return saved

@@ -27,9 +27,11 @@ from src.pdf_utils import (
     extract_figures_from_pdf,
     build_question_mapping, crop_questions_from_pdf,
     extract_figures_per_question,
+    pdf_pages_to_png, save_page_crops,
 )
 from src.vision import call_vision
 from src.mathpix import call_mathpix
+from src.page_classifier import classify_page_with_gpt, detect_layout_with_gpt
 
 app = Flask(__name__)
 
@@ -758,6 +760,60 @@ def validate_qa():
                     os.remove(path)
             except Exception:
                 pass
+
+
+@app.route('/api/general-purpose-extraction', methods=['POST'])
+def general_purpose_extraction():
+    """Classify each page of an uploaded PDF as theory, questions, solutions, or misc."""
+    pdf_path = None
+    tmp_dir = None
+    try:
+        if 'pdf' not in request.files:
+            return jsonify({"error": "Missing required file: pdf"}), 400
+
+        pdf_file = request.files['pdf']
+        if not pdf_file.filename or not pdf_file.filename.lower().endswith('.pdf'):
+            return jsonify({"error": "Uploaded file must be a PDF"}), 400
+
+        pdf_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(pdf_file.filename))
+        pdf_file.save(pdf_path)
+
+        tmp_dir = tempfile.mkdtemp()
+        page_images = pdf_pages_to_png(pdf_path, tmp_dir, prefix="page")
+
+        results = []
+        for page_num, image_path in enumerate(page_images, start=1):
+            classification = classify_page_with_gpt(image_path)
+            page_type = classification.get("page_type")
+
+            entry = {
+                "page": page_num,
+                "page_type": page_type,
+                "confidence": classification.get("confidence"),
+                "reason": classification.get("reason"),
+                "layout": None,
+            }
+
+            if page_type in ("questions", "solutions"):
+                layout = detect_layout_with_gpt(image_path)
+                layout_type = layout.get("layout", "single_column")
+                entry["layout"] = {
+                    "type": layout_type,
+                    "columns": layout.get("columns"),
+                    "confidence": layout.get("confidence"),
+                    "reason": layout.get("reason"),
+                }
+                saved = save_page_crops(
+                    pdf_path, page_num - 1, layout_type, page_type, base_dir=os.getcwd()
+                )
+                entry["saved_images"] = saved
+
+            results.append(entry)
+
+        return jsonify({"total_pages": len(results), "pages": results}), 200
+
+    except Exception as e:
+        return jsonify({"error": f"Processing error: {str(e)}"}), 500
 
 
 if __name__ == '__main__':
