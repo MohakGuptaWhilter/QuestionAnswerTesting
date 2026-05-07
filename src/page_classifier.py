@@ -1,6 +1,9 @@
 import json
 import base64
 from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()  # Load environment variables from .env file
 
 _CLASSIFICATION_PROMPT = (
     "You are a document-page classifier for academic PDFs.\n\n"

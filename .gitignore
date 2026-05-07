@@ -33,3 +33,4 @@ venv.bak/
 *.pdf
 output/
 .vscode/
+questions/
