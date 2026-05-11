@@ -3,13 +3,17 @@ import re
 import numpy as np
 import fitz  # PyMuPDF
 from src.pdf_processor import PDFProcessor
+from src.crop_questions_hybrid import _visual_col_split
 
 _Q_PATTERN = re.compile(
     r'^\s*(?:'
     # Alternative 1 — Q / Question prefix present: delimiter is optional (Q1, Q1., Q.1, Q 1.)
     r'Q(?:uestion)?\.?\s*\(?(\d{1,3})[\s.):,]?'
     r'|'
-    # Alternative 2 — no prefix: dot/paren must be followed by whitespace OR end-of-string.
+    # Alternative 2 — Example / Ex. prefix (e.g. "Example 3", "Ex. 2:", "Ex.4.")
+    r'Ex(?:ample)?\.?\s*\(?(\d{1,3})[\s.):,]?'
+    r'|'
+    # Alternative 3 — no prefix: dot/paren must be followed by whitespace OR end-of-string.
     # The end-of-string branch handles "1." alone on its own line (no trailing space).
     # The positive lookahead for a non-digit after [.)] prevents matching decimals like "45.4".
     r'\(?(\d{1,3})[.)](?=\s|$)'
@@ -19,8 +23,16 @@ _Q_PATTERN = re.compile(
 
 
 def _parse_q_num(m) -> int:
-    """Return the question number from a _Q_PATTERN match (handles both alternatives)."""
-    return int(m.group(1) if m.group(1) is not None else m.group(2))
+    """Return the question number from a _Q_PATTERN match (handles all alternatives)."""
+    return int(next(g for g in (m.group(1), m.group(2), m.group(3)) if g is not None))
+
+# Matches lines that start a solution/answer block within an Example.
+# Handles: "Sol.", "Sol. (b)", "Solution:", "Ans.", "Ans. (a)", "Answer:"
+_SOL_PATTERN = re.compile(
+    r'^\s*(?:Sol(?:ution)?|Ans(?:wer)?)[\s.:()\[]',
+    re.IGNORECASE,
+)
+
 _DPI = 150
 _MAT = fitz.Matrix(_DPI / 72, _DPI / 72)
 
@@ -299,7 +311,7 @@ def save_page_crops(pdf_path: str, page_index: int, layout_type: str,
     saved = []
 
     if layout_type == "multi_column":
-        mid_x = rect.width / 2
+        mid_x = _visual_col_split(page)
         halves = [
             ("left",  fitz.Rect(0,     0, mid_x,      rect.height)),
             ("right", fitz.Rect(mid_x, 0, rect.width, rect.height)),
@@ -319,11 +331,79 @@ def save_page_crops(pdf_path: str, page_index: int, layout_type: str,
     return saved
 
 
-def extract_figures_from_pages(pdf_path: str, page_indices: list, output_dir: str) -> list:
-    """Extract embedded images from a specific subset of pages.
+def _merge_rects(rects: list, gap: float = 5.0) -> list:
+    """Merge overlapping or nearby fitz.Rect objects into larger bounding boxes."""
+    if not rects:
+        return []
+    merged = [fitz.Rect(r) for r in rects]
+    changed = True
+    while changed:
+        changed = False
+        result = []
+        used = [False] * len(merged)
+        for i, r in enumerate(merged):
+            if used[i]:
+                continue
+            combined = fitz.Rect(r)
+            for j in range(i + 1, len(merged)):
+                if used[j]:
+                    continue
+                expanded = fitz.Rect(
+                    combined.x0 - gap, combined.y0 - gap,
+                    combined.x1 + gap, combined.y1 + gap,
+                )
+                if not (expanded & merged[j]).is_empty:
+                    combined |= merged[j]
+                    used[j] = True
+                    changed = True
+            result.append(combined)
+        merged = result
+    return merged
 
-    Same return format as extract_figures_from_pdf — list of (page_idx, y_top, saved_path) —
-    but only processes the pages in page_indices (0-based).
+
+def _find_vector_figure_rects(page, min_area: float = 800.0) -> list:
+    """Return bounding rects of significant vector-drawn figures on the page.
+
+    Skips regions that are mostly covered by text blocks (e.g. table borders,
+    section dividers) to avoid false positives.
+    """
+    drawings = page.get_drawings()
+    if not drawings:
+        return []
+
+    draw_rects = [
+        d["rect"] for d in drawings
+        if not d["rect"].is_empty and d["rect"].get_area() > 0
+    ]
+    if not draw_rects:
+        return []
+
+    merged = _merge_rects(draw_rects, gap=5.0)
+
+    text_rects = [fitz.Rect(b[:4]) for b in page.get_text("blocks") if b[6] == 0]
+
+    results = []
+    for rect in merged:
+        if rect.get_area() < min_area:
+            continue
+        text_area = sum(
+            (rect & tr).get_area() for tr in text_rects if not (rect & tr).is_empty
+        )
+        if text_rects and text_area / rect.get_area() > 0.5:
+            continue
+        results.append(rect)
+
+    return results
+
+
+def extract_figures_from_pages(pdf_path: str, page_indices: list, output_dir: str) -> list:
+    """Extract figures from a specific subset of pages.
+
+    First tries embedded raster images via get_images(). For pages where no
+    embedded images are found, falls back to detecting vector-drawn figures via
+    get_drawings() so that typeset diagrams are also captured.
+
+    Same return format as extract_figures_from_pdf — list of (page_idx, y_top, saved_path).
     """
     os.makedirs(output_dir, exist_ok=True)
     doc = fitz.open(pdf_path)
@@ -335,6 +415,8 @@ def extract_figures_from_pages(pdf_path: str, page_indices: list, output_dir: st
         if page_idx >= len(doc):
             continue
         page = doc[page_idx]
+        page_fig_count = 0
+
         for img_info in page.get_images(full=True):
             xref = img_info[0]
             if xref in seen_xrefs:
@@ -349,6 +431,16 @@ def extract_figures_from_pages(pdf_path: str, page_indices: list, output_dir: st
                 f.write(base_image["image"])
             results.append((page_idx, y_top, out_path))
             fig_idx += 1
+            page_fig_count += 1
+
+        # Fallback: detect vector-drawn figures when no embedded images found
+        if page_fig_count == 0:
+            for fig_rect in _find_vector_figure_rects(page):
+                pix = page.get_pixmap(matrix=_MAT, clip=fig_rect)
+                out_path = os.path.join(output_dir, f"figure_{fig_idx:03d}.png")
+                pix.save(out_path)
+                results.append((page_idx, fig_rect.y0, out_path))
+                fig_idx += 1
 
     doc.close()
     return results
@@ -367,6 +459,7 @@ def map_figures_to_questions_on_pages(pdf_path: str, page_indices: list, fig_dat
     doc = fitz.open(pdf_path)
     markers = []
     expected_num = None
+    section_offset = 0
 
     for page_idx in sorted(set(page_indices)):
         if page_idx >= len(doc):
@@ -382,7 +475,11 @@ def map_figures_to_questions_on_pages(pdf_path: str, page_indices: list, fig_dat
                 continue
             num = _parse_q_num(m)
             if expected_num is None or num == expected_num:
-                markers.append((num, page_idx, block[1]))
+                markers.append((num + section_offset, page_idx, block[1]))
+                expected_num = num + 1
+            elif num < expected_num and num <= 5 and (expected_num - num) > 5:
+                section_offset += expected_num - 1
+                markers.append((num + section_offset, page_idx, block[1]))
                 expected_num = num + 1
 
     doc.close()
@@ -529,6 +626,7 @@ def crop_questions_visual(pdf_path: str, page_indices: list,
 
     markers = []        # (q_num, page_idx, y_top, x0)
     expected_num = None
+    section_offset = 0
     col_split_cache = {}  # page_idx -> gutter x in PDF coordinates
 
     for page_idx in sorted(page_set):
@@ -560,7 +658,12 @@ def crop_questions_visual(pdf_path: str, page_indices: list,
                 continue
             num = _parse_q_num(m)
             if expected_num is None or num == expected_num:
-                markers.append((num, page_idx, y0, x0))
+                markers.append((num + section_offset, page_idx, y0, x0))
+                expected_num = num + 1
+            elif num < expected_num and num <= 5 and (expected_num - num) > 5:
+                # Section numbering restart (e.g. Round II resets to 1 after Round I ends at 76)
+                section_offset += expected_num - 1
+                markers.append((num + section_offset, page_idx, y0, x0))
                 expected_num = num + 1
 
     crops = {}
@@ -631,6 +734,7 @@ def crop_questions_from_pages(pdf_path: str, page_indices: list,
     # markers: (q_num, page_idx, y_top, block_x0)
     markers = []
     expected_num = None
+    section_offset = 0
     col_split_cache = {}  # page_idx -> detected gutter x
 
     for page_idx in sorted(page_set):
@@ -658,7 +762,12 @@ def crop_questions_from_pages(pdf_path: str, page_indices: list,
                 continue
             num = _parse_q_num(m)
             if expected_num is None or num == expected_num:
-                markers.append((num, page_idx, y0, x0))
+                markers.append((num + section_offset, page_idx, y0, x0))
+                expected_num = num + 1
+            elif num < expected_num and num <= 5 and (expected_num - num) > 5:
+                # Section numbering restart (e.g. Round II resets to 1 after Round I ends at 76)
+                section_offset += expected_num - 1
+                markers.append((num + section_offset, page_idx, y0, x0))
                 expected_num = num + 1
 
     crops = {}
@@ -707,6 +816,151 @@ def crop_questions_from_pages(pdf_path: str, page_indices: list,
 
     doc.close()
     return crops
+
+
+def _find_solution_split(page, y_top: float, y_limit: float,
+                          col_x0: float, col_x1: float):
+    """Scan text lines in [y_top, y_limit) × [col_x0, col_x1) for a Sol./Ans. marker.
+
+    Returns the y-coordinate of the first matching line, or None if not found.
+    """
+    for block in page.get_text("dict")["blocks"]:
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            if not spans:
+                continue
+            y0_line = spans[0]["bbox"][1]
+            x0_line = spans[0]["bbox"][0]
+            if y0_line < y_top or y0_line >= y_limit:
+                continue
+            if x0_line < col_x0 or x0_line >= col_x1:
+                continue
+            text = "".join(s["text"] for s in spans).strip()
+            if _SOL_PATTERN.match(text):
+                return y0_line
+    return None
+
+
+def crop_questions_and_answers_from_pages(
+    pdf_path: str, page_indices: list,
+    questions_dir: str, answers_dir: str,
+    layout_by_page: dict = None,
+) -> tuple:
+    """Crop each Example/Question block and split at the Sol./Ans. boundary.
+
+    For each detected marker region:
+    - If a Sol./Ans. line is found inside the block:
+        top part  → questions_dir/question_NNN.png
+        bottom part → answers_dir/answer_NNN.png
+    - Otherwise the full block → questions_dir/question_NNN.png only.
+
+    Returns (q_crops, a_crops) where each is {q_num: absolute_path}.
+    """
+    os.makedirs(questions_dir, exist_ok=True)
+    os.makedirs(answers_dir, exist_ok=True)
+    layout_by_page = layout_by_page or {}
+    doc = fitz.open(pdf_path)
+    page_set = set(page_indices)
+
+    # ── Marker detection (same logic as crop_questions_from_pages) ─────────────
+    markers = []
+    expected_num = None
+    section_offset = 0
+    col_split_cache = {}
+
+    for page_idx in sorted(page_set):
+        if page_idx >= len(doc):
+            continue
+        page = doc[page_idx]
+        layout = layout_by_page.get(page_idx, "single_column")
+        all_lines = _line_markers_from_page(page)
+
+        if layout == "multi_column":
+            mid_x = _detect_col_split(page)
+            col_split_cache[page_idx] = mid_x
+            left  = sorted([l for l in all_lines if l[1] <  mid_x], key=lambda l: (l[2], l[1]))
+            right = sorted([l for l in all_lines if l[1] >= mid_x], key=lambda l: (l[2], l[1]))
+            ordered_lines = left + right
+        else:
+            ordered_lines = sorted(all_lines, key=lambda l: (l[2], l[1]))
+
+        for text, x0, y0 in ordered_lines:
+            m = _Q_PATTERN.match(text)
+            if not m:
+                continue
+            num = _parse_q_num(m)
+            if expected_num is None or num == expected_num:
+                markers.append((num + section_offset, page_idx, y0, x0))
+                expected_num = num + 1
+            elif num < expected_num and num <= 5 and (expected_num - num) > 5:
+                section_offset += expected_num - 1
+                markers.append((num + section_offset, page_idx, y0, x0))
+                expected_num = num + 1
+
+    q_crops: dict = {}
+    a_crops: dict = {}
+
+    if not markers:
+        doc.close()
+        return q_crops, a_crops
+
+    # ── Crop each marker region with optional Sol./Ans. split ──────────────────
+    for q_idx, (q_num, page_idx, y_top, block_x0) in enumerate(markers):
+        page = doc[page_idx]
+        page_rect = page.rect
+        layout = layout_by_page.get(page_idx, "single_column")
+        mid_x = col_split_cache.get(page_idx, page_rect.width / 2)
+
+        if layout == "multi_column":
+            col_x0, col_x1 = (mid_x, page_rect.width) if block_x0 >= mid_x else (0.0, mid_x)
+        else:
+            col_x0, col_x1 = 0.0, page_rect.width
+
+        y_limit = page_rect.height
+        if q_idx + 1 < len(markers):
+            _, np_idx, ny_top, nbx0 = markers[q_idx + 1]
+            if np_idx == page_idx:
+                if layout == "multi_column":
+                    if (nbx0 >= mid_x) == (block_x0 >= mid_x):
+                        y_limit = ny_top
+                else:
+                    y_limit = ny_top
+
+        y0_crop = max(0.0, y_top - 5)
+        raw_bottom = _content_bottom_in_col(page, y_top, y_limit, col_x0, col_x1)
+        y1_crop = min(page_rect.height, raw_bottom + 8)
+
+        if y1_crop - y0_crop < 1 or col_x1 - col_x0 < 1:
+            continue
+
+        sol_y = _find_solution_split(page, y_top, y_limit, col_x0, col_x1)
+
+        if sol_y is not None and sol_y > y_top:
+            # Question part
+            q_clip = fitz.Rect(col_x0, y0_crop, col_x1, sol_y)
+            q_pix = page.get_pixmap(matrix=_MAT, clip=q_clip)
+            q_path = os.path.join(questions_dir, f"question_{q_num:03d}.png")
+            q_pix.save(q_path)
+            q_crops[q_num] = os.path.abspath(q_path)
+
+            # Answer part
+            a_clip = fitz.Rect(col_x0, sol_y, col_x1, y1_crop)
+            a_pix = page.get_pixmap(matrix=_MAT, clip=a_clip)
+            a_path = os.path.join(answers_dir, f"answer_{q_num:03d}.png")
+            a_pix.save(a_path)
+            a_crops[q_num] = os.path.abspath(a_path)
+        else:
+            # No solution marker — full block is the question
+            q_clip = fitz.Rect(col_x0, y0_crop, col_x1, y1_crop)
+            q_pix = page.get_pixmap(matrix=_MAT, clip=q_clip)
+            q_path = os.path.join(questions_dir, f"question_{q_num:03d}.png")
+            q_pix.save(q_path)
+            q_crops[q_num] = os.path.abspath(q_path)
+
+    doc.close()
+    return q_crops, a_crops
 
 
 def detect_layout_fitz(pdf_path: str, page_index: int) -> dict:

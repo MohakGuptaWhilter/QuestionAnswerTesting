@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import base64
 import tempfile
@@ -28,10 +29,11 @@ from src.pdf_utils import (
     build_question_mapping, crop_questions_from_pdf,
     extract_figures_per_question,
     pdf_pages_to_png, save_page_crops, detect_layout_fitz,
+    crop_questions_from_pages,
+    crop_questions_and_answers_from_pages,
     extract_figures_from_pages, map_figures_to_questions_on_pages,
 )
-from src.crop_questions_hybrid import crop_questions_from_page_images
-from src.vision import call_vision, _MODEL_ALIASES
+from src.vision import call_vision, call_vision_with_prompt, _MODEL_ALIASES
 from src.mathpix import call_mathpix
 from src.page_classifier import classify_page_with_gpt
 
@@ -764,21 +766,184 @@ def validate_qa():
                 pass
 
 
-def _transcribe_crops_parallel(crops: dict, figure_map: dict, model: str) -> dict:
-    """Transcribe a {q_num: image_path} dict via VLM. Returns {q_num: text}."""
-    resolved = _MODEL_ALIASES.get(model, model)
-    workers = 3 if resolved.startswith("claude") else _VISION_MAX_WORKERS
 
-    def _do(q_num, path):
-        figs = figure_map.get(q_num) or []
-        try:
-            return q_num, call_vision(path, figure_count=len(figs), model=model)
-        except Exception as exc:
-            return q_num, f"[vision error: {exc}]"
+# ---------------------------------------------------------------------------
+# Prompts for the robust two-step question extraction pipeline
+# ---------------------------------------------------------------------------
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_do, q_num, path): q_num for q_num, path in crops.items()}
-    return {q_num: fut.result()[1] for fut, q_num in [(f, futures[f]) for f in futures]}
+_QUESTION_TRANSCRIBE_PROMPT = """\
+This image shows exactly one exam question. Extract it completely.
+
+Rules:
+1. Include the question number, the full question stem, and ALL answer choices \
+   (e.g. (1)(2)(3)(4) or (A)(B)(C)(D)) exactly as printed.
+2. If a figure, diagram, graph, or image appears anywhere in the question, \
+   insert [Figure 1], [Figure 2], etc. at that exact position in the text.
+3. Write mathematics in plain Unicode — fractions as a/b, square roots as √x, \
+   powers as x² — no LaTeX, no backslashes.
+4. Ignore watermarks, page numbers, footers, and any text outside this question.
+5. Output ONLY the extracted question text, nothing else.
+"""
+
+_SOLUTION_CROP_PROMPT = """\
+This image shows exactly one solution or answer entry from an exam paper.
+Extract the complete answer or solution text.
+
+Rules:
+1. Include the question number and the full answer/solution text exactly as printed.
+2. If the answer is a single option (e.g. (a), (b), (c), (d)), output just that.
+3. If it is a worked solution, include all steps.
+4. Write mathematics in plain Unicode — fractions as a/b, square roots as √x, \
+   powers as x² — no LaTeX, no backslashes.
+5. Ignore watermarks, page numbers, or any text outside this solution entry.
+6. Output ONLY the extracted answer text, nothing else.
+"""
+
+
+# Matches compact answer-key entries: "1.(a)", "2. (c)", "3.b", "10) d", "18.(14.00)", "19.(2130)"
+# Group 1 = question number, Group 2 = answer (letter a-d/A-D OR numeric value)
+_ANS_KEY_ENTRY_RE = re.compile(
+    r'(?<!\d)(\d{1,3})\s*[.)]\s*\(?\s*([a-dA-D]|\d+(?:\.\d+)?)\s*\)?(?!\w)',
+)
+
+
+def _extract_answer_key_from_text(pdf_path: str, s_indices: list) -> dict:
+    """Scan solution pages for compact answer-key entries via PyMuPDF text.
+
+    Handles grid-style keys like '1.(a)  2.(c)  3.(b)' that appear inline in
+    table rows and cannot be individually cropped by crop_questions_from_pages.
+
+    A page is treated as a key page only when >= 3 entries are found, which
+    prevents false positives from incidental number-letter pairs in prose.
+
+    Returns {q_num: "(a)"} — lowercase, parenthesised.
+    """
+    import fitz as _fitz
+    doc = _fitz.open(pdf_path)
+    answers: dict = {}
+    try:
+        for page_idx in s_indices:
+            if page_idx >= len(doc):
+                continue
+            text = doc[page_idx].get_text("text")
+            matches = _ANS_KEY_ENTRY_RE.findall(text)
+            if len(matches) < 3:
+                continue
+            for q_str, ans_letter in matches:
+                q_num = int(q_str)
+                if q_num not in answers:          # first occurrence per question wins
+                    answers[q_num] = f"({ans_letter.lower()})"
+    finally:
+        doc.close()
+    return answers
+
+
+def _extract_question_texts(pdf_path: str, q_indices: list,
+                             layout_by_page: dict, model: str,
+                             output_crops_dir: str = None,
+                             answers_dir: str = None) -> tuple:
+    """Crop each question with PyMuPDF text detection, then VLM transcribes each crop.
+
+    When answers_dir is provided, uses crop_questions_and_answers_from_pages to split
+    each block at its Sol./Ans. line — question part → output_crops_dir,
+    answer part → answers_dir.
+
+    Returns (texts_dict, crops_dict) where texts_dict = {q_num: text}
+    and crops_dict = {q_num: absolute_path} for the question crops only.
+    """
+    import shutil
+
+    use_temp = output_crops_dir is None
+    crop_dir = tempfile.mkdtemp() if use_temp else output_crops_dir
+    if not use_temp:
+        os.makedirs(crop_dir, exist_ok=True)
+
+    try:
+        if answers_dir is not None:
+            os.makedirs(answers_dir, exist_ok=True)
+            crops, _ = crop_questions_and_answers_from_pages(
+                pdf_path, q_indices, crop_dir, answers_dir,
+                layout_by_page=layout_by_page,
+            )
+        else:
+            crops = crop_questions_from_pages(
+                pdf_path, q_indices, crop_dir,
+                prefix="question", layout_by_page=layout_by_page,
+            )
+
+        if not crops:
+            return {}, {}
+
+        resolved = _MODEL_ALIASES.get(model, model)
+        workers = 3 if resolved.startswith("claude") else _VISION_MAX_WORKERS
+
+        def _do(item):
+            q_num, crop_path = item
+            try:
+                text = call_vision_with_prompt(crop_path, _QUESTION_TRANSCRIBE_PROMPT, model)
+                return q_num, text.strip()
+            except Exception:
+                return q_num, ""
+
+        texts = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for q_num, text in pool.map(_do, crops.items()):
+                if text:
+                    texts[q_num] = text
+        return texts, crops
+
+    finally:
+        if use_temp:
+            shutil.rmtree(crop_dir, ignore_errors=True)
+
+
+def _extract_solution_texts(pdf_path: str, s_indices: list,
+                             layout_by_page: dict, model: str,
+                             output_crops_dir: str = None) -> tuple:
+    """Crop each solution entry with PyMuPDF text detection, then VLM transcribes each crop.
+
+    Returns (texts_dict, crops_dict) where texts_dict = {q_num: text}
+    and crops_dict = {q_num: absolute_image_path}.
+    When output_crops_dir is given the crops are saved there permanently;
+    otherwise a temp dir is used and cleaned up.
+    """
+    import shutil
+
+    use_temp = output_crops_dir is None
+    crop_dir = tempfile.mkdtemp() if use_temp else output_crops_dir
+    if not use_temp:
+        os.makedirs(crop_dir, exist_ok=True)
+
+    try:
+        crops = crop_questions_from_pages(
+            pdf_path, s_indices, crop_dir,
+            prefix="solution", layout_by_page=layout_by_page,
+        )
+
+        if not crops:
+            return {}, {}
+
+        resolved = _MODEL_ALIASES.get(model, model)
+        workers = 3 if resolved.startswith("claude") else _VISION_MAX_WORKERS
+
+        def _do(item):
+            q_num, crop_path = item
+            try:
+                text = call_vision_with_prompt(crop_path, _SOLUTION_CROP_PROMPT, model)
+                return q_num, text.strip()
+            except Exception:
+                return q_num, ""
+
+        texts = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for q_num, text in pool.map(_do, crops.items()):
+                if text:
+                    texts[q_num] = text
+        return texts, crops
+
+    finally:
+        if use_temp:
+            shutil.rmtree(crop_dir, ignore_errors=True)
 
 
 @app.route('/api/general-purpose-extraction', methods=['POST'])
@@ -830,23 +995,9 @@ def general_purpose_extraction():
 
             results.append(entry)
 
-        # ── Figure extraction from questions and solutions pages only ──────────
-        figures_base = os.path.join(os.getcwd(), "figures")
-
         q_indices = [p["page"] - 1 for p in results if p["page_type"] == "questions"]
         s_indices = [p["page"] - 1 for p in results if p["page_type"] == "solutions"]
 
-        q_fig_data = extract_figures_from_pages(
-            pdf_path, q_indices, os.path.join(figures_base, "questions")
-        )
-        q_figure_map = map_figures_to_questions_on_pages(pdf_path, q_indices, q_fig_data)
-
-        s_fig_data = extract_figures_from_pages(
-            pdf_path, s_indices, os.path.join(figures_base, "solutions")
-        )
-        s_figure_map = map_figures_to_questions_on_pages(pdf_path, s_indices, s_fig_data)
-
-        # ── Individual question / answer crops ────────────────────────────────
         q_layout = {
             p["page"] - 1: (p["layout"]["type"] if p["layout"] else "single_column")
             for p in results if p["page_type"] == "questions"
@@ -856,31 +1007,46 @@ def general_purpose_extraction():
             for p in results if p["page_type"] == "solutions"
         }
 
-        q_crops = crop_questions_from_page_images(
-            pdf_path, q_indices,
-            os.path.join(os.getcwd(), "question_images"),
-            prefix="question_images",
-            layout_by_page=q_layout,
-        )
-        s_crops = crop_questions_from_page_images(
-            pdf_path, s_indices,
-            os.path.join(os.getcwd(), "solution_images"),
-            prefix="answer_images",
-            layout_by_page=s_layout,
-        )
+        q_images_dir = os.path.join(os.getcwd(), "question_images")
+        a_images_dir = os.path.join(os.getcwd(), "answer_images")
+        os.makedirs(q_images_dir, exist_ok=True)
+        os.makedirs(a_images_dir, exist_ok=True)
 
-        # ── VLM transcription ─────────────────────────────────────────────────
-        q_texts = _transcribe_crops_parallel(q_crops, q_figure_map, model)
-        s_texts = _transcribe_crops_parallel(s_crops, s_figure_map, model)
+        q_texts, q_crops = _extract_question_texts(
+            pdf_path, q_indices, q_layout, model, q_images_dir, answers_dir=a_images_dir,
+        )
+        s_texts, s_crops = _extract_solution_texts(pdf_path, s_indices, s_layout, model, a_images_dir)
+
+        # Fallback: when per-entry marker detection found nothing, save the full
+        # pre-rendered page PNG so the output dirs are never empty.
+        import shutil as _shutil
+        if not q_crops:
+            for page_idx in q_indices:
+                src = page_images[page_idx]
+                _shutil.copy2(src, os.path.join(q_images_dir, f"question_page_{page_idx + 1:03d}.png"))
+        if not s_crops:
+            for page_idx in s_indices:
+                src = page_images[page_idx]
+                _shutil.copy2(src, os.path.join(a_images_dir, f"answer_page_{page_idx + 1:03d}.png"))
+
+        # Compact answer key (e.g. "1.(a)  2.(c)  3.(b)") is extracted via text
+        # scan — no cropping needed — and overrides crop+VLM answers when present.
+        key_answers = _extract_answer_key_from_text(pdf_path, s_indices)
+        merged_answers = {**s_texts, **key_answers}   # key_answers wins on conflict
+
+        # Extract figures embedded in question pages and map to question numbers.
+        figs_dir = os.path.join(tmp_dir, "figures")
+        q_fig_data = extract_figures_from_pages(pdf_path, q_indices, figs_dir)
+        q_fig_map = map_figures_to_questions_on_pages(pdf_path, q_indices, q_fig_data)
 
         excel_rows = [
             {
                 "question_num":  str(q_num),
                 "question_text": sanitize(latex_to_unicode(q_texts.get(q_num, ""))),
-                "figures":       ", ".join(os.path.basename(p) for p in (q_figure_map.get(q_num) or [])),
-                "answers":       sanitize(latex_to_unicode(s_texts.get(q_num, ""))),
+                "figures":       ", ".join(os.path.basename(p) for p in q_fig_map.get(q_num, [])),
+                "answers":       sanitize(latex_to_unicode(merged_answers.get(q_num, ""))),
             }
-            for q_num in sorted(set(q_texts) | set(s_texts))
+            for q_num in sorted(set(q_texts) | set(merged_answers))
         ]
 
         output_excel = os.path.join(app.config['UPLOAD_FOLDER'], 'general_extraction_output.xlsx')

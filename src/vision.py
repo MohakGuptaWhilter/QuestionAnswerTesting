@@ -85,3 +85,67 @@ def call_vision(image_path: str, figure_count: int = 0, model: str = _VISION_MOD
         from src.gpt_vision import call_vision_model_gpt
         return call_vision_model_gpt(image_path, figure_count, resolved)
     return call_vision_model(image_path, figure_count)  # Ollama (default)
+
+
+def call_vision_with_prompt(image_path: str, prompt: str, model: str = _VISION_MODEL) -> str:
+    """Call the correct vision backend with a fully custom prompt string."""
+    resolved = _MODEL_ALIASES.get(model, model)
+
+    with open(image_path, "rb") as f:
+        image_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    if resolved.startswith("claude"):
+        import time
+        import random
+        import anthropic
+        client = anthropic.Anthropic()
+        for attempt in range(7):
+            try:
+                msg = client.messages.create(
+                    model=resolved,
+                    max_tokens=2048,
+                    temperature=0,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "source": {
+                                "type": "base64", "media_type": "image/png", "data": image_b64,
+                            }},
+                            {"type": "text", "text": prompt},
+                        ],
+                    }],
+                )
+                return msg.content[0].text.strip()
+            except anthropic.RateLimitError:
+                if attempt == 6:
+                    raise
+                time.sleep(5.0 * (2 ** attempt) + random.uniform(0, 2))
+
+    if resolved.startswith("gpt") or resolved.startswith("o1") or resolved.startswith("o3"):
+        from openai import OpenAI
+        client = OpenAI()
+        response = client.chat.completions.create(
+            model=resolved,
+            max_tokens=2048,
+            temperature=0,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        return response.choices[0].message.content.strip()
+
+    # Ollama default
+    payload = {
+        "model": _VISION_MODEL,
+        "messages": [{"role": "user", "content": prompt, "images": [image_b64]}],
+        "stream": False,
+        "options": {"temperature": 0, "num_predict": 2048},
+    }
+    resp = requests.post(_OLLAMA_URL, json=payload, timeout=180)
+    resp.raise_for_status()
+    return resp.json()["message"]["content"].strip()
