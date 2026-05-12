@@ -322,6 +322,9 @@ class DocumentGraphBuilder:
                 "question_type":
                     question.question_type,
 
+                "options":
+                    question.options,
+
                 "confidence":
                     question.confidence,
 
@@ -331,6 +334,32 @@ class DocumentGraphBuilder:
                         "verified",
                         False
                     ),
+
+                "verification_score":
+                    getattr(
+                        question,
+                        "verification_score",
+                        None
+                    ),
+
+                "retry_recommended":
+                    getattr(
+                        question,
+                        "retry_recommended",
+                        False
+                    ),
+
+                "verification_issues": [
+                    {
+                        "severity": issue.severity,
+                        "message": issue.message,
+                    }
+                    for issue in getattr(
+                        question,
+                        "verification_issues",
+                        []
+                    )
+                ],
             }
         )
 
