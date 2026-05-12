@@ -13,6 +13,8 @@ from openpyxl.utils import get_column_letter
 import pandas as pd
 import requests as _http
 from rapidfuzz import fuzz as _fuzz
+from arihant_pipeline.exporter import Exporter
+from arihant_pipeline.general_purpose_extraction_pipeline import GeneralPurposeExtractionPipeline
 from src.pdf_processor import PDFProcessor
 from src.quickstart import parse_pdf
 from src.helpers import (
@@ -36,6 +38,8 @@ from src.pdf_utils import (
 from src.vision import call_vision, call_vision_with_prompt, _MODEL_ALIASES
 from src.mathpix import call_mathpix
 from src.page_classifier import classify_page_with_gpt
+from arihant_pipeline.pipeline_config import PipelineConfig
+
 
 app = Flask(__name__)
 
@@ -1075,5 +1079,87 @@ def general_purpose_extraction():
                 pass
 
 
+@app.route('/api/arihant-pdfs', methods=['POST'])
+def arihant_pdfs():
+    pdf_path = None
+
+    try:
+        # -----------------------------
+        # Validate request
+        # -----------------------------
+        if 'pdf' not in request.files:
+            return jsonify({"error": "Missing required file: pdf"}), 400
+
+        pdf_file = request.files['pdf']
+
+        if (
+            not pdf_file.filename
+            or not pdf_file.filename.lower().endswith('.pdf')
+        ):
+            return jsonify({"error": "Uploaded file must be a PDF"}), 400
+
+        # -----------------------------
+        # Save uploaded PDF
+        # -----------------------------
+        model_name = request.form.get(
+            "model",
+            "claude-haiku"
+        )
+
+        pdf_path = os.path.join(
+            app.config['UPLOAD_FOLDER'],
+            secure_filename(pdf_file.filename)
+        )
+
+        pdf_file.save(pdf_path)
+
+        # -----------------------------
+        # Build pipeline config
+        # -----------------------------
+        config = PipelineConfig(
+            vlm_model=model_name,
+            dpi=300,
+            crop_padding=12,
+            enable_mathpix=True,
+            pipeline_type="arihant"
+        )
+
+        # -----------------------------
+        # Run pipeline
+        # -----------------------------
+        pipeline = GeneralPurposeExtractionPipeline(config)
+
+        result = pipeline.run(pdf_path)
+
+        # -----------------------------
+        # Export
+        # -----------------------------
+        exporter = Exporter(config)
+
+        output_excel = exporter.export(
+            result,
+            output_dir=app.config['UPLOAD_FOLDER']
+        )
+
+        return send_file(
+            output_excel,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name='arihant_extraction.xlsx',
+        )
+
+    except Exception as e:
+        return jsonify({
+            "error": f"Processing error: {str(e)}"
+        }), 500
+
+    finally:
+        import shutil
+
+        if pdf_path and os.path.exists(pdf_path):
+            try:
+                os.remove(pdf_path)
+            except Exception:
+                pass
 if __name__ == '__main__':
     app.run(debug=True, host='localhost', port=5000)
