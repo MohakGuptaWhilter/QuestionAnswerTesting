@@ -7,6 +7,7 @@ import PdfToImages from './modes/PdfToImages';
 import MathpixExtractor from './modes/MathpixExtractor';
 import ValidateQA from './modes/ValidateQA';
 import GeneralPurposeExtraction from './modes/GeneralPurposeExtraction';
+import ArihantExtraction from './modes/ArihantExtraction';
 import './PDFUploader.css';
 
 const PDFUploader = () => {
@@ -21,6 +22,7 @@ const PDFUploader = () => {
   const [mathpixModel, setMathpixModel] = useState('text');
   const [ptiModel, setPtiModel] = useState('qwen2.5vl:7b');
   const [gpModel, setGpModel] = useState('qwen2.5vl:7b');
+  const [arihantModel, setArihantModel] = useState('claude-haiku');
   const [singlePdf, setSinglePdf] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -170,6 +172,19 @@ const PDFUploader = () => {
     triggerDownload(await res.blob(), 'questions_output.xlsx');
   };
 
+  const handleArihantExtraction = async () => {
+    const fd = new FormData();
+    fd.append('pdf', singlePdf);
+    fd.append('model', arihantModel);
+
+    const res = await fetch('/api/arihant-pdfs', { method: 'POST', body: fd });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `Server error ${res.status}`);
+    }
+    triggerDownload(await res.blob(), 'arihant_extraction.xlsx');
+  };
+
   const handleGeneralPurposeExtraction = async () => {
     const fd = new FormData();
     fd.append('pdf', singlePdf);
@@ -222,7 +237,7 @@ const PDFUploader = () => {
       setError('Please select both PDF files and the Excel sheet.');
       return;
     }
-    if (mode === 'general-purpose' && !singlePdf) {
+    if ((mode === 'general-purpose' || mode === 'arihant') && !singlePdf) {
       setError('Please select a PDF file.');
       return;
     }
@@ -246,6 +261,7 @@ const PDFUploader = () => {
       else if (mode === 'mathpix') await handleMathpixExtract();
       else if (mode === 'validate') await handleValidate();
       else if (mode === 'general-purpose') await handleGeneralPurposeExtraction();
+      else if (mode === 'arihant') await handleArihantExtraction();
       // else if (mode === 'evaluate') await handleEvaluate();
       // else if (mode === 'evaluate-excel') await handleEvaluateExcel();
       // else if (mode === 'clean-excel') await handleCleanExcel();
@@ -266,7 +282,7 @@ const PDFUploader = () => {
       ? !!(questionsPdf && answersPdf)
       : mode === 'validate'
       ? !!(questionsPdf && answersPdf && excelFile)
-      : mode === 'general-purpose'
+      : (mode === 'general-purpose' || mode === 'arihant')
       ? !!singlePdf
       // : mode === 'evaluate'
       // ? questionsPdf && answersPdf && agentId.trim() && deploymentSlug.trim()
@@ -343,6 +359,20 @@ const PDFUploader = () => {
           result={generalPurposeResult}
           onPdfChange={(e) => handlePdfChange(e, setSinglePdf, 'PDF')}
           onModelChange={setGpModel}
+          onSubmit={handleSubmit}
+          canSubmit={canSubmit}
+        />
+      )}
+
+      {mode === 'arihant' && (
+        <ArihantExtraction
+          singlePdf={singlePdf}
+          model={arihantModel}
+          loading={loading}
+          error={error}
+          success={success}
+          onPdfChange={(e) => handlePdfChange(e, setSinglePdf, 'PDF')}
+          onModelChange={setArihantModel}
           onSubmit={handleSubmit}
           canSubmit={canSubmit}
         />

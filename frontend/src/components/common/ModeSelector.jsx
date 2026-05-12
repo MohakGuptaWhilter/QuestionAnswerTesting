@@ -8,6 +8,7 @@ const ModeSelector = ({ mode, loading, onModeChange }) => {
     { id: 'mathpix', label: 'Extract (Mathpix)' },
     { id: 'validate', label: 'Validate Q&A' },
     { id: 'general-purpose', label: 'Page Classifier' },
+    { id: 'arihant', label: 'Arihant Extraction' },
     // { id: 'evaluate', label: 'Evaluate (PDFs)' },
     // { id: 'evaluate-excel', label: 'Evaluate (Excel)' },
     // { id: 'clean-excel', label: 'Clean Excel' },

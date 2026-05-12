@@ -1,0 +1,22 @@
+.arihant-form {
+  background: white;
+  border-radius: 12px;
+  padding: 30px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  margin-bottom: 30px;
+}
+
+.arihant-form h2 {
+  color: #333;
+  margin-top: 0;
+  margin-bottom: 10px;
+  font-size: 24px;
+}
+
+.submit-button.arihant {
+  background: #d97706;
+}
+
+.submit-button.arihant:hover:not(:disabled) {
+  background: #b45309;
+}
