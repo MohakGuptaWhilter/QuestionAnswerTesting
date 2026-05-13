@@ -1,12 +1,9 @@
-/* Container for the uploader - all other styles are imported from modular component CSS files */
 .uploader-container {
-  max-width: 600px;
-  margin: 0 auto;
-  padding: 40px 20px;
+  width: 100%;
 }
 
 @media (max-width: 600px) {
   .uploader-container {
-    padding: 20px 10px;
+    padding: 0;
   }
 }

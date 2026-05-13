@@ -98,7 +98,7 @@ class SemanticRegionBuilder:
         self.max_vertical_gap = getattr(
             config,
             "max_vertical_gap",
-            120
+            40
         )
 
     # =====================================================
@@ -190,6 +190,10 @@ class SemanticRegionBuilder:
             else max(block_map.keys()) + 1
         )
 
+        # When unbounded, confine growth to the anchor's own page
+        anchor_page = anchor.page_number
+        single_page_only = next_anchor is None
+
         current_idx = start_idx
 
         # ---------------------------------------------
@@ -210,6 +214,13 @@ class SemanticRegionBuilder:
                 .ordered_block
                 .layout_block
             )
+
+            # -----------------------------------------
+            # Stop if we've left the anchor page and
+            # there is no bounding next anchor
+            # -----------------------------------------
+            if single_page_only and layout_block.page_number != anchor_page:
+                break
 
             # -----------------------------------------
             # Stop if incompatible semantic type
@@ -331,10 +342,16 @@ class SemanticRegionBuilder:
         ]
 
         # ---------------------------------------------
-        # Bounding box
+        # Bounding box — only use blocks on page_start
+        # so cross-page blocks don't corrupt coordinates
         # ---------------------------------------------
+        p_start = min(b.page_number for b in layout_blocks)
+        first_page_blocks = [
+            b for b in layout_blocks
+            if b.page_number == p_start
+        ]
         bbox = self._merge_bboxes(
-            [b.bbox for b in layout_blocks]
+            [b.bbox for b in first_page_blocks]
         )
 
         # ---------------------------------------------

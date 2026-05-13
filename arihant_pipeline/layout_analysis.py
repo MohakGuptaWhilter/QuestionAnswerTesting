@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import List, Tuple
+import re
 import uuid
 
 from arihant_pipeline.pdf_loader import TextBlock
@@ -31,6 +32,12 @@ class LayoutAnalyzer:
     Responsible for converting raw PDF blocks
     into coherent visual layout regions.
     """
+
+    # Patterns that must start a new block — never merge INTO these
+    BLOCK_START_PATTERN = re.compile(
+        r"^(example\s+\d+\.|sol\.|ans\.|\d+\.\s)",
+        re.IGNORECASE
+    )
 
     def __init__(self, config):
 
@@ -70,7 +77,7 @@ class LayoutAnalyzer:
 
         for nxt in sorted_blocks[1:]:
 
-            if self._should_merge_bboxes(cur_bbox, nxt.bbox):
+            if self._should_merge_bboxes(cur_bbox, nxt.bbox) and not self.BLOCK_START_PATTERN.match(nxt.text.strip()):
 
                 cur_text += "\n" + nxt.text
                 cur_lines = cur_lines + list(nxt.lines)
@@ -129,6 +136,9 @@ class LayoutAnalyzer:
         return vertical_gap < 20 and same_alignment
 
     def _should_merge(self, b1, b2):
+
+        if self.BLOCK_START_PATTERN.match(b2.text.strip()):
+            return False
 
         return self._should_merge_bboxes(b1.bbox, b2.bbox)
 

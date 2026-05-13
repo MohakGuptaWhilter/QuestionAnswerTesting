@@ -1,3 +1,8 @@
+import os
+from pathlib import Path
+from PIL import Image
+import numpy as np
+
 from arihant_pipeline.pdf_loader import PDFLoader
 from arihant_pipeline.page_render import PageRenderer
 from arihant_pipeline.layout_analysis import LayoutAnalyzer
@@ -36,6 +41,19 @@ class GeneralPurposeExtractionPipeline:
         self.verifier = ExtractionVerifier(config)
         self.graph_builder = DocumentGraphBuilder(config)
     
+    def _save_crops(self, crops, pdf_path):
+        project_root = Path(__file__).resolve().parent.parent
+        out_root = project_root / "crops" / Path(pdf_path).stem
+        for crop in crops:
+            folder = out_root / crop.region_type
+            folder.mkdir(parents=True, exist_ok=True)
+            fname = f"qid_{crop.qid}_p{crop.page_number}_{crop.crop_id[:8]}.png"
+            img = crop.image
+            if isinstance(img, np.ndarray):
+                img = Image.fromarray(img)
+            img.save(folder / fname)
+        print(f"[Pipeline] Saved {len(crops)} crops → {out_root}")
+
     def run(self, pdf_path):
 
         # -----------------------------------
@@ -111,6 +129,11 @@ class GeneralPurposeExtractionPipeline:
         # -----------------------------------
         # Stage 11: OCR/VLM
         # -----------------------------------
+        _TRANSCRIBE_TYPES = {"examples","question", "solution", "answer_key"}
+        crops = [c for c in crops if c.region_type in _TRANSCRIBE_TYPES]
+
+        self._save_crops(crops, pdf_path)
+
         transcriptions = self.transcriber.transcribe(
             crops
         )

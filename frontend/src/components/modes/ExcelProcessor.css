@@ -1,16 +1,16 @@
 .excel-processor-form {
   background: white;
   border-radius: 12px;
-  padding: 30px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-  margin-bottom: 30px;
+  padding: 28px 32px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 0 0 1px rgba(0,0,0,0.05);
+  margin-bottom: 0;
 }
 
 .excel-processor-form h2 {
-  color: #333;
+  color: #1e293b;
   margin-top: 0;
-  margin-bottom: 25px;
-  font-size: 24px;
+  margin-bottom: 16px;
+  font-size: 20px;
 }
 
 .excel-processor-form .evaluate-info {

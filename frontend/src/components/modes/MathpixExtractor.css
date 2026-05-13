@@ -1,16 +1,16 @@
 .mathpix-extractor-form {
   background: white;
   border-radius: 12px;
-  padding: 30px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-  margin-bottom: 30px;
+  padding: 28px 32px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 0 0 1px rgba(0,0,0,0.05);
+  margin-bottom: 0;
 }
 
 .mathpix-extractor-form h2 {
-  color: #333;
+  color: #1e293b;
   margin-top: 0;
-  margin-bottom: 25px;
-  font-size: 24px;
+  margin-bottom: 16px;
+  font-size: 20px;
 }
 
 .mathpix-extractor-form .mathpix-info {
@@ -29,21 +29,6 @@
   border-radius: 3px;
   padding: 1px 4px;
   font-size: 12px;
-}
-
-.model-select {
-  width: 100%;
-  padding: 8px 10px;
-  border: 1px solid #ccc;
-  border-radius: 6px;
-  font-size: 14px;
-  background: white;
-  cursor: pointer;
-}
-
-.model-select:disabled {
-  background: #f5f5f5;
-  cursor: not-allowed;
 }
 
 .submit-button.mathpix {

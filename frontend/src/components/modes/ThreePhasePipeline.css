@@ -1,0 +1,42 @@
+.three-phase-form {
+  background: white;
+  border-radius: 12px;
+  padding: 28px 32px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 0 0 1px rgba(0,0,0,0.05);
+  margin-bottom: 0;
+}
+
+.three-phase-form h2 {
+  color: #1e293b;
+  margin-top: 0;
+  margin-bottom: 10px;
+  font-size: 20px;
+}
+
+.pipeline-phases {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 14px 0 20px;
+}
+
+.phase-badge {
+  padding: 5px 14px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  color: white;
+  letter-spacing: 0.02em;
+}
+
+.phase-1 { background: #4f46e5; }
+.phase-2 { background: #0891b2; }
+.phase-3 { background: #059669; }
+
+.submit-button.three-phase {
+  background: #4f46e5;
+}
+
+.submit-button.three-phase:hover:not(:disabled) {
+  background: #4338ca;
+}

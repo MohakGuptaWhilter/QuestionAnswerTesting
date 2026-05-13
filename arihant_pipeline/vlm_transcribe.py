@@ -5,6 +5,7 @@ import numpy as np
 from PIL import Image
 import io
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # =========================================================
@@ -77,80 +78,47 @@ class VLMTranscriber:
 
     def transcribe(
         self,
-        crops
+        crops,
+        max_workers: int = 8,
     ) -> List[Transcription]:
 
-        transcriptions = []
+        def _transcribe_one(crop):
+            raw_text = self._run_vlm(crop.image)
+            normalized = self._normalize_text(raw_text)
+            confidence = self._estimate_confidence(normalized)
+            return Transcription(
+                transcription_id=str(uuid.uuid4()),
+                crop_id=crop.crop_id,
+                region_type=crop.region_type,
+                qid=crop.qid,
+                raw_text=raw_text,
+                normalized_text=normalized,
+                confidence=confidence,
+                metadata={
+                    "page_number": crop.page_number,
+                    "model": self.model,
+                    "region_type": crop.region_type,
+                },
+            )
 
-        for crop in crops:
+        results: dict = {}
 
-            try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {
+                executor.submit(_transcribe_one, crop): i
+                for i, crop in enumerate(crops)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    print(
+                        f"[VLMTranscriber] Failed "
+                        f"{crops[idx].crop_id}: {str(e)}"
+                    )
 
-                # -------------------------------------
-                # Run OCR/VLM
-                # -------------------------------------
-                raw_text = self._run_vlm(
-                    crop.image
-                )
-
-                # -------------------------------------
-                # Normalize text
-                # -------------------------------------
-                normalized = self._normalize_text(
-                    raw_text
-                )
-
-                # -------------------------------------
-                # Estimate confidence
-                # -------------------------------------
-                confidence = self._estimate_confidence(
-                    normalized
-                )
-
-                # -------------------------------------
-                # Build transcription object
-                # -------------------------------------
-                transcription = Transcription(
-
-                    transcription_id=str(uuid.uuid4()),
-
-                    crop_id=crop.crop_id,
-
-                    region_type=crop.region_type,
-
-                    qid=crop.qid,
-
-                    raw_text=raw_text,
-
-                    normalized_text=normalized,
-
-                    confidence=confidence,
-
-                    metadata={
-
-                        "page_number":
-                            crop.page_number,
-
-                        "model":
-                            self.model,
-
-                        "region_type":
-                            crop.region_type
-                    }
-                )
-
-                transcriptions.append(
-                    transcription
-                )
-
-            except Exception as e:
-
-                print(
-                    f"[VLMTranscriber] Failed "
-                    f"{crop.crop_id}: {str(e)}"
-                )
-
-        return transcriptions
+        return [results[i] for i in sorted(results)]
 
     # =====================================================
     # IMAGE CONVERSION
@@ -185,62 +153,98 @@ class VLMTranscriber:
     ) -> str:
         """
         Main OCR/VLM inference function.
-
-        Replace this implementation
-        with your actual model call.
+        Routes to Claude, OpenAI, or Ollama based on self.model.
         """
 
-        image_bytes = self._image_to_bytes(
-            image
+        image_bytes = self._image_to_bytes(image)
+
+        prompt = (
+            "Transcribe the image EXACTLY as written.\n\n"
+            "Rules:\n"
+            "- Preserve equations.\n"
+            "- Preserve symbols.\n"
+            "- Preserve MCQ options.\n"
+            "- Preserve line breaks.\n"
+            "- Preserve chemistry notation.\n"
+            "- Preserve mathematical notation.\n"
+            "- Do NOT summarize.\n"
+            "- Do NOT solve the question.\n"
+            "- Do NOT explain anything.\n"
+            "Return only the transcription."
         )
 
-        # ---------------------------------------------
-        # OCR/VLM prompt
-        # ---------------------------------------------
-        prompt = """
-Transcribe the image EXACTLY as written.
+        import base64 as _b64
 
-Rules:
-- Preserve equations.
-- Preserve symbols.
-- Preserve MCQ options.
-- Preserve line breaks.
-- Preserve chemistry notation.
-- Preserve mathematical notation.
-- Do NOT summarize.
-- Do NOT solve the question.
-- Do NOT explain anything.
-Return only the transcription.
-"""
+        _ALIASES = {
+            "haiku":         "claude-haiku-4-5-20251001",
+            "claude-haiku":  "claude-haiku-4-5-20251001",
+            "sonnet":        "claude-sonnet-4-6",
+            "claude-sonnet": "claude-sonnet-4-6",
+            "gpt-4o":        "gpt-4o",
+            "gpt-4o-mini":   "gpt-4o-mini",
+        }
 
-        # =================================================
-        # PLACEHOLDER MODEL CALL
-        # =================================================
-        #
-        # Replace with:
-        # - Ollama
-        # - Claude
-        # - OpenAI
-        # - Qwen
-        # - MathPix
-        #
-        # Example:
-        #
-        # response = your_vlm_api(
-        #     model=self.model,
-        #     image=image_bytes,
-        #     prompt=prompt
-        # )
-        #
-        # return response
-        #
-        # =================================================
+        resolved = _ALIASES.get(self.model, self.model)
+        image_b64 = _b64.b64encode(image_bytes).decode()
 
-        simulated_response = (
-            "[PLACEHOLDER OCR OUTPUT]"
-        )
+        if resolved.startswith("claude"):
+            import time
+            import random
+            import anthropic
+            client = anthropic.Anthropic()
+            for attempt in range(7):
+                try:
+                    msg = client.messages.create(
+                        model=resolved,
+                        max_tokens=2048,
+                        temperature=0,
+                        messages=[{
+                            "role": "user",
+                            "content": [
+                                {"type": "image", "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": image_b64,
+                                }},
+                                {"type": "text", "text": prompt},
+                            ],
+                        }],
+                    )
+                    return msg.content[0].text.strip()
+                except anthropic.RateLimitError:
+                    if attempt == 6:
+                        raise
+                    time.sleep(5.0 * (2 ** attempt) + random.uniform(0, 2))
 
-        return simulated_response
+        if resolved.startswith("gpt") or resolved.startswith("o1") or resolved.startswith("o3"):
+            from openai import OpenAI
+            client = OpenAI()
+            response = client.chat.completions.create(
+                model=resolved,
+                max_tokens=2048,
+                temperature=0,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                        {"type": "text", "text": prompt},
+                    ],
+                }],
+            )
+            return response.choices[0].message.content.strip()
+
+        # Ollama default
+        import requests as _req
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt, "images": [image_b64]}],
+            "stream": False,
+            "options": {"temperature": 0, "num_predict": 2048},
+        }
+        resp = _req.post("http://localhost:11434/api/chat", json=payload, timeout=180)
+        resp.raise_for_status()
+        return resp.json()["message"]["content"].strip()
 
     # =====================================================
     # TEXT NORMALIZATION

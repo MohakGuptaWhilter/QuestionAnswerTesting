@@ -66,16 +66,14 @@ class SolutionLinker:
         questions
     ) -> List[LinkedQuestion]:
 
-        linked_questions = []
-
-        question_map = {}
+        question_list = []
 
         solution_pool = []
 
         answer_key_pool = []
 
         # ---------------------------------------------
-        # Separate objects
+        # Separate objects, preserving order
         # ---------------------------------------------
         for q in questions:
 
@@ -84,78 +82,33 @@ class SolutionLinker:
                 "question"
             )
 
-            # -----------------------------------------
-            # Questions
-            # -----------------------------------------
             if region_type == "question":
 
-                question_map[q.qid] = q
+                question_list.append(q)
 
-            # -----------------------------------------
-            # Solutions
-            # -----------------------------------------
             elif region_type == "solution":
 
                 solution_pool.append(q)
 
-            # -----------------------------------------
-            # Answer keys
-            # -----------------------------------------
             elif region_type == "answer_key":
 
                 answer_key_pool.append(q)
 
         # =================================================
-        # LINK SOLUTIONS
+        # LINK SOLUTIONS — positional: nth question ↔ nth solution
         # =================================================
 
-        for solution in solution_pool:
+        for i, solution in enumerate(solution_pool):
 
-            qid = solution.qid
+            if i >= len(question_list):
+                break
 
-            if qid in question_map:
+            target = question_list[i]
 
-                target = question_map[qid]
-
-                solution_text = (
-                    solution.solution_text
-                    or solution.question_text
-                )
-
-                target.solution_text = solution_text
-
-                # Confidence boost
-                target.confidence = min(
-                    1.0,
-                    target.confidence + 0.05
-                )
-
-            else:
-
-                # -------------------------------------
-                # Attempt fallback linkage
-                # -------------------------------------
-                fallback_qid = (
-                    self._fallback_match_solution(
-                        solution,
-                        question_map
-                    )
-                )
-
-                if fallback_qid:
-
-                    target = question_map[
-                        fallback_qid
-                    ]
-
-                    target.solution_text = (
-                        solution.solution_text
-                        or solution.question_text
-                    )
-
-                    target.metadata[
-                        "fallback_solution_match"
-                    ] = True
+            target.solution_text = (
+                solution.solution_text
+                or solution.question_text
+            )
 
         # =================================================
         # LINK ANSWER KEYS
@@ -165,93 +118,31 @@ class SolutionLinker:
             answer_key_pool
         )
 
-        for qid, question in question_map.items():
+        for question in question_list:
 
-            if qid in answer_map:
+            if question.qid in answer_map:
 
-                question.answer = answer_map[qid]
+                question.answer = answer_map[
+                    question.qid
+                ]
 
         # =================================================
         # BUILD FINAL LINKED OBJECTS
         # =================================================
 
-        for qid, question in question_map.items():
-
-            linked_questions.append(
-
-                LinkedQuestion(
-
-                    qid=question.qid,
-
-                    question_text=
-                        question.question_text,
-
-                    options=question.options,
-
-                    answer=question.answer,
-
-                    solution_text=
-                        question.solution_text,
-
-                    question_type=
-                        question.question_type,
-
-                    confidence=
-                        question.confidence,
-
-                    metadata=question.metadata
-                )
+        return [
+            LinkedQuestion(
+                qid=q.qid,
+                question_text=q.question_text,
+                options=q.options,
+                answer=q.answer,
+                solution_text=q.solution_text,
+                question_type=q.question_type,
+                confidence=q.confidence,
+                metadata=q.metadata
             )
-
-        return linked_questions
-
-    # =====================================================
-    # FALLBACK MATCHING
-    # =====================================================
-
-    def _fallback_match_solution(
-        self,
-        solution,
-        question_map
-    ) -> Optional[str]:
-        """
-        Attempt fuzzy linkage when exact
-        qid matching fails.
-        """
-
-        solution_qid = solution.qid
-
-        if not solution_qid:
-            return None
-
-        # ---------------------------------------------
-        # Normalize numeric IDs
-        # ---------------------------------------------
-        digits = re.findall(
-            r"\d+",
-            str(solution_qid)
-        )
-
-        if not digits:
-            return None
-
-        normalized = digits[0]
-
-        for qid in question_map.keys():
-
-            q_digits = re.findall(
-                r"\d+",
-                str(qid)
-            )
-
-            if not q_digits:
-                continue
-
-            if q_digits[0] == normalized:
-
-                return qid
-
-        return None
+            for q in question_list
+        ]
 
     # =====================================================
     # ANSWER KEY PARSING
