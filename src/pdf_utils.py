@@ -443,9 +443,11 @@ def extract_figures_from_pages(pdf_path: str, page_indices: list, output_dir: st
             if xref in seen_xrefs:
                 continue
             seen_xrefs.add(xref)
+            base_image = doc.extract_image(xref)
+            if base_image["width"] < 40 or base_image["height"] < 40:
+                continue
             rects = page.get_image_rects(xref)
             y_top = rects[0].y0 if rects else 0.0
-            base_image = doc.extract_image(xref)
             ext = base_image["ext"]
             out_path = os.path.join(output_dir, f"figure_{fig_idx:03d}.{ext}")
             with open(out_path, "wb") as f:

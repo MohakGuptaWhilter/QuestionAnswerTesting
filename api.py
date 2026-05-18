@@ -431,7 +431,7 @@ def general_purpose_extraction():
         key_answers, _ = extract_answer_keys_from_regions(pdf_path, s_indices)
 
         # ── 5. Map embedded figures to question numbers ────────────────────────
-        figs_dir  = os.path.join(tmp_dir, "figures")
+        figs_dir  = os.path.join(app.config['UPLOAD_FOLDER'], "figures")
         q_fig_map = map_figures_to_questions_on_pages(
             pdf_path, q_indices,
             extract_figures_from_pages(pdf_path, q_indices, figs_dir),
@@ -442,15 +442,17 @@ def general_purpose_extraction():
         # so gaps in image-file numbering don't appear as jumps in the sheet.
         all_q_nums = sorted(set(q_texts) | set(key_answers) | set(s_texts))
         excel_rows = []
-        for row_idx, q_num in enumerate(all_q_nums, start=1):
+        row_counter = 0
+        for q_num in all_q_nums:
             qt = sanitize(latex_to_unicode(q_texts.get(q_num, "")))
             ak = sanitize(latex_to_unicode(key_answers.get(q_num, "")))
             sol = sanitize(latex_to_unicode(s_texts.get(q_num, "")))
             figs = ", ".join(os.path.basename(p) for p in q_fig_map.get(q_num, []))
             if not any([qt, ak, sol, figs]):
                 continue
+            row_counter += 1
             excel_rows.append({
-                "question_num":  str(row_idx),
+                "question_num":  str(row_counter),
                 "question_text": qt,
                 "figures":       figs,
                 "answer_key":    ak,
