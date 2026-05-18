@@ -21,10 +21,31 @@ _Q_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Exercise-only pattern: drops the Ex/Example alternative to avoid false matches on
+# question/solution pages where "Example N" appears only as a cross-reference, not a marker.
+_Q_PATTERN_EXERCISE = re.compile(
+    r'^\s*(?:'
+    r'Q(?:uestion)?\.?\s*\(?(\d{1,3})[\s.):,]?'
+    r'|'
+    r'\(?(\d{1,3})[.)](?=[\s(]|$)'
+    r')',
+    re.IGNORECASE,
+)
+
+# Used to detect answer-key rows: a compact grid like "1. (a)  2. (c)  3. (c)..."
+# always contains a SECOND num. entry after the first match.  Single-entry solution
+# lines like "9. (a) 28.7 pm × ..." never do.
+_Q_INLINE_RE = re.compile(r'(?<!\d)\d{1,3}[.)](?=\s)')
+
 
 def _parse_q_num(m) -> int:
     """Return the question number from a _Q_PATTERN match (handles all alternatives)."""
     return int(next(g for g in (m.group(1), m.group(2), m.group(3)) if g is not None))
+
+
+def _parse_q_num_exercise(m) -> int:
+    """Return question number from a _Q_PATTERN_EXERCISE match (two groups only)."""
+    return int(next(g for g in (m.group(1), m.group(2)) if g is not None))
 
 # Matches lines that start a solution/answer block within an Example.
 # Handles: "Sol.", "Sol. (b)", "Solution:", "Ans.", "Ans. (a)", "Answer:"
@@ -507,14 +528,21 @@ def map_figures_to_questions_on_pages(pdf_path: str, page_indices: list, fig_dat
 
 def _content_bottom_in_col(page, y_start: float, y_limit: float,
                             col_x0: float, col_x1: float) -> float:
-    """Like _content_bottom but only considers blocks that overlap the column x-range."""
+    """Like _content_bottom but only considers blocks that overlap the column x-range.
+
+    A block qualifies when its y-range overlaps [y_start, y_limit) — the block may
+    start slightly before y_start because span y-coords (used for markers) are more
+    precise than block y-coords.
+    """
     bottom = y_start
     for block in page.get_text("blocks"):
-        if block[1] < y_start or block[1] >= y_limit:
+        if block[3] <= y_start or block[1] >= y_limit:  # no y overlap
             continue
-        if block[2] <= col_x0 or block[0] >= col_x1:   # no x overlap with column
+        if block[2] <= col_x0 or block[0] >= col_x1:    # no x overlap with column
             continue
-        bottom = max(bottom, block[3])
+        # Cap at y_limit: a single block can span multiple questions in dense
+        # typesetting — never let one block extend the crop past the next marker.
+        bottom = max(bottom, min(block[3], y_limit))
     return bottom
 
 
@@ -544,6 +572,44 @@ def _detect_col_split(page) -> float:
             split = (central[i] + central[i + 1]) / 2
 
     return split if best_gap > pw * 0.05 else pw / 2
+
+
+def _refine_col_split(page, rough_split: float,
+                      min_y: float = 0.0) -> float:
+    """Refine a rough column-split estimate to the true gutter midpoint.
+
+    Uses block bounding boxes (restricted to y >= min_y to skip answer-key /
+    header rows that can span both columns) to find the maximum right-edge of
+    left-column content and the minimum left-edge of right-column content.
+    Blocks whose x0 falls within 40 px of rough_split (centered headers,
+    gutter labels) are also excluded.
+    Falls back to rough_split if the gutter cannot be determined.
+    """
+    pw = page.rect.width
+    margin = 40.0
+    blocks = [b for b in page.get_text("blocks")
+              if b[6] == 0 and len(b[4].strip()) > 3 and b[1] >= min_y]
+    if not blocks:
+        return rough_split
+
+    left_x1 = 0.0
+    right_x0 = pw
+    for b in blocks:
+        bx0, bx1 = b[0], b[2]
+        # Skip very wide blocks (full-page headers / footers)
+        if bx1 - bx0 > pw * 0.7:
+            continue
+        # Skip blocks whose x0 is close to the rough boundary (gutter noise)
+        if abs(bx0 - rough_split) < margin:
+            continue
+        if bx0 < rough_split:
+            left_x1 = max(left_x1, bx1)
+        else:
+            right_x0 = min(right_x0, bx0)
+
+    if right_x0 > left_x1 and left_x1 > 0 and right_x0 < pw:
+        return (left_x1 + right_x0) / 2
+    return rough_split
 
 
 def _col_split_visual(page) -> float:
@@ -653,10 +719,14 @@ def crop_questions_visual(pdf_path: str, page_indices: list,
             ordered = sorted(all_lines, key=lambda l: (l[2], l[1]))
 
         for text, x0, y0 in ordered:
-            m = _Q_PATTERN.match(text)
+            m = _Q_PATTERN_EXERCISE.match(text)
             if not m:
                 continue
-            num = _parse_q_num(m)
+            # Skip answer-key rows: "1. (a)  2. (c)  3. (c)..." has a second entry
+            # after the first match; genuine solution lines like "9. (a) 28.7 pm..." do not.
+            if _Q_INLINE_RE.search(text[m.end():]):
+                continue
+            num = _parse_q_num_exercise(m)
             if expected_num is None or num == expected_num:
                 markers.append((num + section_offset, page_idx, y0, x0))
                 expected_num = num + 1
@@ -700,7 +770,7 @@ def crop_questions_visual(pdf_path: str, page_indices: list,
         raw_bottom = _content_bottom_in_col(page, y_top, y_limit, col_x0, col_x1)
         y1_crop = min(page_rect.height, raw_bottom + 8)
 
-        if y1_crop - y0_crop < 1 or col_x1 - col_x0 < 1:
+        if y1_crop - y0_crop < 20 or col_x1 - col_x0 < 1:
             continue
 
         clip = fitz.Rect(col_x0, y0_crop, col_x1, y1_crop)
@@ -711,6 +781,21 @@ def crop_questions_visual(pdf_path: str, page_indices: list,
 
     doc.close()
     return crops
+
+
+def _stitch_images_vertically(paths: list, out_path: str) -> None:
+    """Stack PNG images top-to-bottom into a single file using Pillow."""
+    from PIL import Image
+    imgs = [Image.open(p) for p in paths]
+    max_w = max(img.width for img in imgs)
+    total_h = sum(img.height for img in imgs)
+    canvas = Image.new("RGB", (max_w, total_h), (255, 255, 255))
+    y_off = 0
+    for img in imgs:
+        canvas.paste(img, (0, y_off))
+        y_off += img.height
+        img.close()
+    canvas.save(out_path)
 
 
 def crop_questions_from_pages(pdf_path: str, page_indices: list,
@@ -746,9 +831,10 @@ def crop_questions_from_pages(pdf_path: str, page_indices: list,
         # Use line-level positions from get_text("dict") so Q-numbers found on any
         # line of a block get the correct y coordinate, not just the block top.
         all_lines = _line_markers_from_page(page)
+        print(f"[crop_solutions] page {page_idx} layout={layout} lines={len(all_lines)}")
 
         if layout == "multi_column":
-            mid_x = _detect_col_split(page)
+            mid_x = _col_split_visual(page)
             col_split_cache[page_idx] = mid_x
             left  = sorted([l for l in all_lines if l[1] <  mid_x], key=lambda l: (l[2], l[1]))
             right = sorted([l for l in all_lines if l[1] >= mid_x], key=lambda l: (l[2], l[1]))
@@ -757,11 +843,13 @@ def crop_questions_from_pages(pdf_path: str, page_indices: list,
             ordered_lines = sorted(all_lines, key=lambda l: (l[2], l[1]))
 
         for text, x0, y0 in ordered_lines:
-            m = _Q_PATTERN.match(text)
+            m = _Q_PATTERN_EXERCISE.match(text)
             if not m:
                 continue
-            num = _parse_q_num(m)
-            if expected_num is None or num == expected_num:
+            if _Q_INLINE_RE.search(text[m.end():]):
+                continue  # answer-key row: "1. (a)  2. (c)..." has a second entry
+            num = _parse_q_num_exercise(m)
+            if expected_num is None or num >= expected_num:
                 markers.append((num + section_offset, page_idx, y0, x0))
                 expected_num = num + 1
             elif num < expected_num and num <= 5 and (expected_num - num) > 5:
@@ -791,7 +879,9 @@ def crop_questions_from_pages(pdf_path: str, page_indices: list,
             col_x0, col_x1 = 0.0, page_rect.width
 
         # y_limit: next marker in the same column on the same page
+        # cross_page_info: set when the next marker is on a different page
         y_limit = page_rect.height
+        cross_page_info = None  # (next_page_idx, next_y_top) when continuation exists
         if q_idx + 1 < len(markers):
             _, np_idx, ny_top, nbx0 = markers[q_idx + 1]
             if np_idx == page_idx:
@@ -800,18 +890,325 @@ def crop_questions_from_pages(pdf_path: str, page_indices: list,
                         y_limit = ny_top
                 else:
                     y_limit = ny_top
+            else:
+                # Next marker is on a different page — content may continue there
+                cross_page_info = (np_idx, ny_top)
 
         y0 = max(0.0, y_top - 5)
         raw_bottom = _content_bottom_in_col(page, y_top, y_limit, col_x0, col_x1)
         y1 = min(page_rect.height, raw_bottom + 8)
 
-        if y1 - y0 < 1 or col_x1 - col_x0 < 1:
+        # Skip degenerate single-line crops (answer-key grid entries, stray markers).
+        # At 150 DPI a normal body line is ~20 pt → ~42 px; require at least 30 pt.
+        if y1 - y0 < 30 or col_x1 - col_x0 < 1:
             continue
 
         clip = fitz.Rect(col_x0, y0, col_x1, y1)
         pix = page.get_pixmap(matrix=_MAT, clip=clip)
         out_path = os.path.join(output_dir, f"{prefix}_{q_num:03d}.png")
-        pix.save(out_path)
+
+        if cross_page_info is None:
+            pix.save(out_path)
+        else:
+            # This entry's content may spill onto subsequent pages.
+            # Build a list of image parts, then stitch them vertically.
+            np_idx, ny_top = cross_page_info
+            part0 = os.path.join(output_dir, f"{prefix}_{q_num:03d}_part0.png")
+            pix.save(part0)
+            parts = [part0]
+
+            # Any full pages classified as solution/question pages that fall
+            # between the current page and the next-marker page
+            for inter_idx in sorted(page_set):
+                if inter_idx <= page_idx or inter_idx >= np_idx:
+                    continue
+                inter_pix = doc[inter_idx].get_pixmap(matrix=_MAT)
+                inter_path = os.path.join(output_dir, f"{prefix}_{q_num:03d}_part{inter_idx}.png")
+                inter_pix.save(inter_path)
+                parts.append(inter_path)
+
+            # Content on the next-marker page before the next entry starts
+            if ny_top > 5:
+                np_page = doc[np_idx]
+                cont_clip = fitz.Rect(0.0, 0.0, np_page.rect.width, ny_top - 5)
+                cont_pix = np_page.get_pixmap(matrix=_MAT, clip=cont_clip)
+                cont_path = os.path.join(output_dir, f"{prefix}_{q_num:03d}_cont.png")
+                cont_pix.save(cont_path)
+                parts.append(cont_path)
+
+            if len(parts) == 1:
+                os.rename(parts[0], out_path)
+            else:
+                _stitch_images_vertically(parts, out_path)
+                for p in parts:
+                    try: os.remove(p)
+                    except OSError: pass
+
+        crops[q_num] = os.path.abspath(out_path)
+
+    doc.close()
+    return crops
+
+def _detect_answer_key_region(lines):
+    """
+    Detect dense answer-key grids like:
+    1.(a) 2.(b) 3.(c)...   (MCQ)
+    18.(14.00) 19.(2130) 20.(26.92)...  (Numeric Value)
+
+    A row qualifies only when it has ≥3 compact entries AND the average
+    characters per entry is low (< 20).  The density check prevents long
+    solution lines that incidentally contain three numbers from being
+    misclassified as answer-key rows.
+
+    Returns:
+        (y0, y1) region to ignore
+        OR None
+    """
+    # Matches genuine answer-key entries where the answer is in parentheses:
+    #   MCQ:  "1.(a)"  "17.(c)"  "1. (d)"
+    #   NVQ:  "18.(14.00)"  "19.(2130)"  "20.(26.92)"
+    # The parentheses are REQUIRED so plain chemistry decimals like "69.9",
+    # "55.85", "1.25" (which appear in solution tables) never match.
+    ANSWER_PAT = re.compile(
+        r'(?<!\d)\d{1,3}\s*[.)]\s*\(\s*(?:[a-dA-D]|\d+(?:[.,]\d+)?)\s*\)'
+    )
+    # Wider bucket so spans on the same visual row that vary by a few pts
+    # (common with superscript/subscript rendering) are merged correctly.
+    Y_TOLERANCE = 6  # pt
+
+    rows: dict[int, list] = {}
+    for text, x0, y0 in lines:
+        bucket = round(y0 / Y_TOLERANCE)
+        rows.setdefault(bucket, []).append((text, y0))
+
+    candidate_rows = []
+    for bucket, items in rows.items():
+        combined = " ".join(re.sub(r"\s+", " ", t.strip()) for t, _ in items)
+        matches = ANSWER_PAT.findall(combined)
+        # Density guard: answer-key entries are compact; solution lines are verbose.
+        # "1.(a)" ≈ 5 chars/entry; a solution line with 3 numbers ≈ 60+ chars/entry.
+        if len(matches) >= 3 and len(combined) / len(matches) < 20:
+            row_y = items[0][1]
+            candidate_rows.append(row_y)
+
+    if not candidate_rows:
+        return None
+
+    return (
+        min(candidate_rows) - 5,
+        max(candidate_rows) + 20
+    )
+
+
+def crop_solutions_from_pages(
+    pdf_path: str, page_indices: list,
+    output_dir: str, prefix: str = "solution",
+    layout_by_page: dict = None,
+) -> dict:
+    """Crop individual solution entries from solution/answer pages to PNG files.
+
+    Key differences from crop_questions_from_pages:
+    - Does NOT skip rows where multiple numbered entries appear on one line
+      (e.g. answer-key grids "1.(a) 2.(c)...") — those are valid solution starts.
+    - Uses a lower minimum crop height (10 pt vs 30 pt) since single-line
+      answers like "1. (a)" are common on solution pages.
+    - Cross-page stitching works the same way as the question counterpart.
+
+    Returns {q_num: absolute_path}.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    layout_by_page = layout_by_page or {}
+    effective_layout = dict(layout_by_page)  # local copy — augmented with auto-detected layouts
+    doc = fitz.open(pdf_path)
+    page_set = set(page_indices)
+
+    markers = []
+    expected_num = None
+    section_offset = 0
+    col_split_cache = {}
+
+    for page_idx in sorted(page_set):
+        if page_idx >= len(doc):
+            continue
+        page = doc[page_idx]
+        layout = effective_layout.get(page_idx, "single_column")
+        all_lines = _line_markers_from_page(page)
+        print(f"[crop_solutions] page {page_idx} layout={layout} lines={len(all_lines)}")
+
+        # -----------------------------------
+        # Remove entire answer-key region
+        # BEFORE column splitting
+        # -----------------------------------
+
+        ignore_region = _detect_answer_key_region(all_lines)
+        print(f"[crop_solutions] page {page_idx} ignore_region={ignore_region}")
+
+        if ignore_region is not None:
+            ignore_y0, ignore_y1 = ignore_region
+            solution_lines = [
+                l for l in all_lines
+                if not (ignore_y0 <= l[2] <= ignore_y1)
+            ]
+            # If nearly all content was filtered (pure answer-key page misclassified
+            # as solutions), skip this page so its entries don't corrupt expected_num.
+            filtered_ratio = 1 - len(solution_lines) / max(len(all_lines), 1)
+            if filtered_ratio > 0.85:
+                print(f"[crop_solutions] page {page_idx}: skipped — {filtered_ratio:.0%} answer-key content")
+                continue
+        else:
+            solution_lines = all_lines
+
+        # Auto-detect two-column layout when not explicitly specified.
+        # _detect_col_split finds the largest gap between block x-starts; if it
+        # falls significantly off-centre the page is almost certainly two-column.
+        # _refine_col_split then adjusts to the actual gutter midpoint using
+        # block right-edges, so the crop boundary falls between the columns.
+        if layout == "single_column":
+            auto_mid = _detect_col_split(page)
+            pw = page.rect.width
+            if abs(auto_mid - pw / 2) > pw * 0.04:
+                # Restrict block analysis to the solution area (below answer key)
+                # so that wide answer-key rows don't corrupt the gutter estimate.
+                sol_min_y = ignore_region[1] if ignore_region is not None else 0.0
+                auto_mid = _refine_col_split(page, auto_mid, min_y=sol_min_y)
+                layout = "multi_column"
+                effective_layout[page_idx] = "multi_column"
+                col_split_cache[page_idx] = auto_mid
+                print(f"[crop_solutions] page {page_idx}: auto-detected multi_column split at x={auto_mid:.1f}")
+
+        if layout == "multi_column":
+            mid_x = col_split_cache.get(page_idx) or _col_split_visual(page)
+            col_split_cache[page_idx] = mid_x
+            left  = sorted([l for l in solution_lines if l[1] <  mid_x], key=lambda l: (l[2], l[1]))
+            right = sorted([l for l in solution_lines if l[1] >= mid_x], key=lambda l: (l[2], l[1]))
+            ordered_lines = left + right
+        else:
+            ordered_lines = sorted(solution_lines, key=lambda l: (l[2], l[1]))
+
+        # Print first 30 lines so we can see what text the PDF actually produces
+        print(f"[crop_solutions] page {page_idx} first lines:")
+        for _t, _x, _y in ordered_lines[:30]:
+            print(f"  y={_y:.1f} x={_x:.1f} | {_t[:80]!r}")
+
+        page_markers_before = len(markers)
+        for text, x0, y0 in ordered_lines:
+            m = _Q_PATTERN_EXERCISE.match(text)
+            if not m:
+                continue
+            # Reject plain "N." matches (no Q-prefix) where the remainder starts with
+            # a lowercase letter — these are chemistry lines like "22. g of CaO",
+            # not question markers.  "(a)" or capital-letter starts are still accepted.
+            if m.group(1) is None:
+                remainder = text[m.end():].lstrip()
+                if remainder and remainder[0].islower():
+                    print(f"  [SKIP-CHEM] num={_parse_q_num_exercise(m)} text={text[:40]!r}")
+                    continue
+            else:
+                remainder = ""
+            num = _parse_q_num_exercise(m)
+            if expected_num is None or num >= expected_num:
+                # Reject suspiciously large forward jumps (false positives like
+                # "112." appearing as a step/formula number inside a solution body).
+                if expected_num is not None and num > expected_num + 30:
+                    print(f"  [SKIP-JUMP] num={num} expected_num={expected_num} text={text[:40]!r}")
+                    continue
+                markers.append((num + section_offset, page_idx, y0, x0))
+                expected_num = num + 1
+                print(f"  [marker] Q{num+section_offset} at y={y0:.1f} x={x0:.1f}")
+            elif num < expected_num and num <= 5 and (expected_num - num) > 5:
+                # Require some content after the number for section-reset detection.
+                # Standalone "3." or "4." inside a solution body must not be treated
+                # as the start of a new section.  Genuine Round-II starters like
+                # "1. (c)" or "1. To find..." always carry content.
+                if not remainder and num != 1:
+                    print(f"  [SKIP] num={num} expected_num={expected_num} text={text[:40]!r}")
+                    continue
+                section_offset += expected_num - 1
+                markers.append((num + section_offset, page_idx, y0, x0))
+                expected_num = num + 1
+                print(f"  [marker] Q{num+section_offset} at y={y0:.1f} x={x0:.1f} (section reset)")
+            else:
+                print(f"  [SKIP] num={num} expected_num={expected_num} text={text[:40]!r}")
+        print(f"[crop_solutions] page {page_idx}: {len(markers)-page_markers_before} markers added")
+
+    crops = {}
+    if not markers:
+        doc.close()
+        return crops
+
+    for q_idx, (q_num, page_idx, y_top, block_x0) in enumerate(markers):
+        page = doc[page_idx]
+        page_rect = page.rect
+        layout = effective_layout.get(page_idx, "single_column")
+        mid_x = col_split_cache.get(page_idx, page_rect.width / 2)
+
+        if layout == "multi_column":
+            col_x0, col_x1 = (mid_x, page_rect.width) if block_x0 >= mid_x else (0.0, mid_x)
+        else:
+            col_x0, col_x1 = 0.0, page_rect.width
+
+        y_limit = page_rect.height
+        cross_page_info = None
+        if q_idx + 1 < len(markers):
+            _, np_idx, ny_top, nbx0 = markers[q_idx + 1]
+            if np_idx == page_idx:
+                if layout == "multi_column":
+                    if (nbx0 >= mid_x) == (block_x0 >= mid_x):
+                        y_limit = ny_top
+                else:
+                    y_limit = ny_top
+            else:
+                cross_page_info = (np_idx, ny_top)
+
+        y0_crop = max(0.0, y_top - 5)
+        if cross_page_info is not None:
+            # Solution continues onto the next page — take the full remaining page.
+            y1_crop = page_rect.height
+        else:
+            raw_bottom = _content_bottom_in_col(page, y_top, y_limit, col_x0, col_x1)
+            y1_crop = min(page_rect.height, raw_bottom + 8)
+
+        # Lower minimum height than questions (10 pt vs 30 pt) —
+        # many solution entries are a single line like "1. (a)".
+        if y1_crop - y0_crop < 10 or col_x1 - col_x0 < 1:
+            continue
+
+        clip = fitz.Rect(col_x0, y0_crop, col_x1, y1_crop)
+        pix = page.get_pixmap(matrix=_MAT, clip=clip)
+        out_path = os.path.join(output_dir, f"{prefix}_{q_num:03d}.png")
+
+        if cross_page_info is None:
+            pix.save(out_path)
+        else:
+            np_idx, ny_top = cross_page_info
+            part0 = os.path.join(output_dir, f"{prefix}_{q_num:03d}_part0.png")
+            pix.save(part0)
+            parts = [part0]
+
+            for inter_idx in sorted(page_set):
+                if inter_idx <= page_idx or inter_idx >= np_idx:
+                    continue
+                inter_pix = doc[inter_idx].get_pixmap(matrix=_MAT)
+                inter_path = os.path.join(output_dir, f"{prefix}_{q_num:03d}_part{inter_idx}.png")
+                inter_pix.save(inter_path)
+                parts.append(inter_path)
+
+            if ny_top > 5:
+                np_page = doc[np_idx]
+                cont_clip = fitz.Rect(0.0, 0.0, np_page.rect.width, ny_top - 5)
+                cont_pix = np_page.get_pixmap(matrix=_MAT, clip=cont_clip)
+                cont_path = os.path.join(output_dir, f"{prefix}_{q_num:03d}_cont.png")
+                cont_pix.save(cont_path)
+                parts.append(cont_path)
+
+            if len(parts) == 1:
+                os.rename(parts[0], out_path)
+            else:
+                _stitch_images_vertically(parts, out_path)
+                for p in parts:
+                    try: os.remove(p)
+                    except OSError: pass
+
         crops[q_num] = os.path.abspath(out_path)
 
     doc.close()
@@ -878,7 +1275,7 @@ def crop_questions_and_answers_from_pages(
         all_lines = _line_markers_from_page(page)
 
         if layout == "multi_column":
-            mid_x = _detect_col_split(page)
+            mid_x = _col_split_visual(page)
             col_split_cache[page_idx] = mid_x
             left  = sorted([l for l in all_lines if l[1] <  mid_x], key=lambda l: (l[2], l[1]))
             right = sorted([l for l in all_lines if l[1] >= mid_x], key=lambda l: (l[2], l[1]))
@@ -887,10 +1284,12 @@ def crop_questions_and_answers_from_pages(
             ordered_lines = sorted(all_lines, key=lambda l: (l[2], l[1]))
 
         for text, x0, y0 in ordered_lines:
-            m = _Q_PATTERN.match(text)
+            m = _Q_PATTERN_EXERCISE.match(text)
             if not m:
                 continue
-            num = _parse_q_num(m)
+            if _Q_INLINE_RE.search(text[m.end():]):
+                continue  # answer-key row: "1. (a)  2. (c)..." has a second entry
+            num = _parse_q_num_exercise(m)
             if expected_num is None or num == expected_num:
                 markers.append((num + section_offset, page_idx, y0, x0))
                 expected_num = num + 1
@@ -932,7 +1331,7 @@ def crop_questions_and_answers_from_pages(
         raw_bottom = _content_bottom_in_col(page, y_top, y_limit, col_x0, col_x1)
         y1_crop = min(page_rect.height, raw_bottom + 8)
 
-        if y1_crop - y0_crop < 1 or col_x1 - col_x0 < 1:
+        if y1_crop - y0_crop < 20 or col_x1 - col_x0 < 1:
             continue
 
         sol_y = _find_solution_split(page, y_top, y_limit, col_x0, col_x1)
@@ -978,12 +1377,18 @@ def detect_layout_fitz(pdf_path: str, page_index: int) -> dict:
     blocks = page.get_text("blocks")
     doc.close()
 
-    # Keep only text blocks in the content body (below the top-25 % header band)
+    # Keep only substantive content blocks:
+    #   - below the top-10 % header band
+    #   - above the bottom-10 % footer/page-number band
+    #   - wide enough to be real content (not narrow page-number or watermark glyphs)
+    #   - at least 20 chars so single-word watermarks ("SAMPLE", "NW.EXAMS") are excluded
     content_blocks = [
         b for b in blocks
         if b[6] == 0
-        and b[1] > page_height * 0.25
-        and len(b[4].strip()) > 10
+        and b[1] > page_height * 0.10
+        and b[3] < page_height * 0.90
+        and (b[2] - b[0]) > page_width * 0.08
+        and len(b[4].strip()) > 20
     ]
 
     if len(content_blocks) < 4:
@@ -994,13 +1399,17 @@ def detect_layout_fitz(pdf_path: str, page_index: int) -> dict:
             "reason": "Too few content blocks to determine layout",
         }
 
-    # A right-column block starts past 35 % of the page width
-    col_threshold = page_width * 0.35
-    left_blocks  = [b for b in content_blocks if b[0] <= col_threshold]
-    right_blocks = [b for b in content_blocks if b[0] >  col_threshold]
+    # A genuine right column starts in the middle zone of the page (30 %–75 %).
+    # Blocks that start past 75 % are page numbers, running headers, or binding
+    # margins — not a real second column.
+    left_threshold  = page_width * 0.30
+    right_zone_max  = page_width * 0.75
+
+    left_blocks  = [b for b in content_blocks if b[0] <= left_threshold]
+    right_blocks = [b for b in content_blocks if left_threshold < b[0] <= right_zone_max]
 
     if len(right_blocks) >= 3 and len(left_blocks) >= 3:
-        return {
+        result = {
             "layout": "multi_column",
             "columns": 2,
             "confidence": 0.92,
@@ -1009,10 +1418,17 @@ def detect_layout_fitz(pdf_path: str, page_index: int) -> dict:
                 f"{len(right_blocks)} blocks in right column"
             ),
         }
+    else:
+        result = {
+            "layout": "single_column",
+            "columns": 1,
+            "confidence": 0.92,
+            "reason": f"All {len(content_blocks)} content blocks start in the left region",
+        }
 
-    return {
-        "layout": "single_column",
-        "columns": 1,
-        "confidence": 0.92,
-        "reason": f"All {len(content_blocks)} content blocks start in the left region",
-    }
+    print(
+        f"[detect_layout] page {page_index}: {result['layout']}"
+        f"  left={len(left_blocks)} right={len(right_blocks)}"
+        f"  total_content={len(content_blocks)}"
+    )
+    return result

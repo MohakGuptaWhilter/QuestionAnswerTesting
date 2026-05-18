@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import List, Optional
 import uuid
+import re
 
 
 # =========================================================
@@ -10,12 +11,11 @@ import uuid
 @dataclass
 class SemanticRegion:
     """
-    Represents a complete semantic object.
+    Represents a semantically complete region.
 
-    Examples:
-    - Full question
-    - Full solution
-    - Full solved example
+    IMPORTANT:
+    Region is fundamentally represented by BLOCKS,
+    not only by bbox.
     """
 
     region_id: str
@@ -38,54 +38,26 @@ class SemanticRegion:
 
 
 # =========================================================
-# SEMANTIC REGION BUILDER
+# IMPROVED SEMANTIC REGION BUILDER
 # =========================================================
 
 class SemanticRegionBuilder:
     """
-    Builds complete semantic regions from anchors.
+    Production-grade semantic region builder.
 
-    Responsibilities:
-    - grow question regions
-    - grow solution regions
-    - attach equations/options
-    - attach continuation blocks
-    - stop at semantic boundaries
+    Major improvements:
+    - semantic continuation scoring
+    - proper solution termination
+    - topic drift detection
+    - hard stop patterns
+    - cleaner bbox generation
+    - no aggressive misc absorption
 
-    THIS IS THE MOST IMPORTANT STAGE
-    for correct cropping.
+    THIS STAGE DETERMINES:
+    - crop correctness
+    - OCR correctness
+    - solution extraction quality
     """
-
-    # -----------------------------------------------------
-    # Semantic compatibility map
-    # -----------------------------------------------------
-
-    REGION_COMPATIBILITY = {
-        "question": {
-            "question",
-            "formula",
-            "table",
-            "misc",
-        },
-
-        "solution": {
-            "solution",
-            "formula",
-            "table",
-            "misc",
-        },
-
-        "example": {
-            "example",
-            "formula",
-            "table",
-            "misc",
-        },
-
-        "answer_key": {
-            "answer_key",
-        },
-    }
 
     # =====================================================
     # INIT
@@ -95,11 +67,63 @@ class SemanticRegionBuilder:
 
         self.config = config
 
+        # ---------------------------------------------
+        # Spatial controls
+        # ---------------------------------------------
         self.max_vertical_gap = getattr(
             config,
             "max_vertical_gap",
-            40
+            60
         )
+
+        # ---------------------------------------------
+        # Continuation threshold
+        # ---------------------------------------------
+        self.continuation_threshold = getattr(
+            config,
+            "continuation_threshold",
+            0.45
+        )
+
+        # ---------------------------------------------
+        # Safety limits
+        # ---------------------------------------------
+        self.max_region_blocks = getattr(
+            config,
+            "max_region_blocks",
+            30
+        )
+
+        # ---------------------------------------------
+        # Compatible semantic types
+        # ---------------------------------------------
+        # IMPORTANT:
+        # Removed dangerous "misc"
+        # ---------------------------------------------
+        self.region_compatibility = {
+
+            "question": {
+                "question",
+                "formula",
+                "table",
+            },
+
+            "solution": {
+                "solution",
+                "formula",
+                "table",
+            },
+
+            "example": {
+                "example",
+                "formula",
+                "table",
+            },
+
+            "answer_key": {
+                "answer_key",
+            },
+        }
 
     # =====================================================
     # PUBLIC API
@@ -114,14 +138,14 @@ class SemanticRegionBuilder:
         semantic_regions = []
 
         # ---------------------------------------------
-        # Create fast lookup by reading index
+        # Reading-order lookup
         # ---------------------------------------------
         block_map = self._build_block_map(
             classified_blocks
         )
 
         # ---------------------------------------------
-        # Sort anchors by reading order
+        # Sort anchors
         # ---------------------------------------------
         anchors = sorted(
             anchors,
@@ -129,7 +153,7 @@ class SemanticRegionBuilder:
         )
 
         # ---------------------------------------------
-        # Build semantic region per anchor
+        # Grow region per anchor
         # ---------------------------------------------
         for idx, anchor in enumerate(anchors):
 
@@ -139,8 +163,11 @@ class SemanticRegionBuilder:
                 next_anchor = anchors[idx + 1]
 
             region = self._grow_region(
+
                 anchor=anchor,
+
                 next_anchor=next_anchor,
+
                 block_map=block_map
             )
 
@@ -149,7 +176,7 @@ class SemanticRegionBuilder:
         return semantic_regions
 
     # =====================================================
-    # BLOCK MAP
+    # BUILD BLOCK MAP
     # =====================================================
 
     def _build_block_map(
@@ -182,7 +209,7 @@ class SemanticRegionBuilder:
 
         anchor_type = anchor.anchor_type
 
-        start_idx = anchor.reading_index
+        current_idx = anchor.reading_index
 
         end_limit = (
             next_anchor.reading_index
@@ -190,127 +217,325 @@ class SemanticRegionBuilder:
             else max(block_map.keys()) + 1
         )
 
-        # When unbounded, confine growth to the anchor's own page
-        anchor_page = anchor.page_number
-        single_page_only = next_anchor is None
-
-        current_idx = start_idx
-
         # ---------------------------------------------
-        # Grow forward
+        # Grow semantically
         # ---------------------------------------------
         while current_idx < end_limit:
 
             if current_idx not in block_map:
+
                 current_idx += 1
                 continue
 
-            classified = block_map[current_idx]
-
-            semantic_type = classified.semantic_type
+            candidate = block_map[current_idx]
 
             layout_block = (
-                classified
+                candidate
                 .ordered_block
                 .layout_block
             )
 
             # -----------------------------------------
-            # Stop if we've left the anchor page and
-            # there is no bounding next anchor
+            # HARD TERMINATION
             # -----------------------------------------
-            if single_page_only and layout_block.page_number != anchor_page:
-                break
-
-            # -----------------------------------------
-            # Stop if incompatible semantic type
-            # -----------------------------------------
-            if not self._is_compatible(
-                anchor_type,
-                semantic_type
+            if self._is_hard_stop(
+                candidate,
+                anchor_type
             ):
                 break
 
             # -----------------------------------------
-            # Stop if spatial continuity broken
+            # Safety limit
             # -----------------------------------------
-            if region_blocks:
+            if len(region_blocks) >= self.max_region_blocks:
+                break
 
-                prev_block = (
-                    region_blocks[-1]
-                    .ordered_block
-                    .layout_block
-                )
+            # -----------------------------------------
+            # First block always accepted
+            # -----------------------------------------
+            if not region_blocks:
 
-                if not self._has_spatial_continuity(
-                    prev_block,
-                    layout_block
-                ):
-                    break
+                region_blocks.append(candidate)
 
-            region_blocks.append(classified)
+                current_idx += 1
+                continue
+
+            # -----------------------------------------
+            # Continuation score
+            # -----------------------------------------
+            score = self._continuation_score(
+
+                region_blocks=region_blocks,
+
+                candidate_block=candidate,
+
+                anchor_type=anchor_type
+            )
+
+            # -----------------------------------------
+            # Stop if semantic continuity weak
+            # -----------------------------------------
+            if score < self.continuation_threshold:
+                break
+
+            region_blocks.append(candidate)
 
             current_idx += 1
 
-        # ---------------------------------------------
-        # Build final semantic region
-        # ---------------------------------------------
         return self._build_region(
             anchor,
             region_blocks
         )
 
     # =====================================================
-    # COMPATIBILITY CHECK
+    # HARD TERMINATION
     # =====================================================
 
-    def _is_compatible(
+    def _is_hard_stop(
         self,
-        region_type,
-        semantic_type
+        candidate,
+        anchor_type
     ) -> bool:
 
-        allowed = self.REGION_COMPATIBILITY.get(
-            region_type,
-            set()
+        text = (
+            candidate
+            .ordered_block
+            .layout_block
+            .text
+            .strip()
         )
 
-        return semantic_type in allowed
-
-    # =====================================================
-    # SPATIAL CONTINUITY
-    # =====================================================
-
-    def _has_spatial_continuity(
-        self,
-        block1,
-        block2
-    ) -> bool:
+        # ---------------------------------------------
+        # New question pattern
+        # ---------------------------------------------
+        if re.match(
+            r"^(Q\.?\s*\d+|\d+\.)",
+            text,
+            re.I
+        ):
+            return True
 
         # ---------------------------------------------
-        # Same page
+        # New solution pattern
         # ---------------------------------------------
-        if block1.page_number == block2.page_number:
-
-            vertical_gap = (
-                block2.bbox[1]
-                - block1.bbox[3]
+        if (
+            anchor_type != "solution"
+            and re.match(
+                r"^(Sol\.?|Solution)",
+                text,
+                re.I
             )
-
-            return vertical_gap < self.max_vertical_gap
+        ):
+            return True
 
         # ---------------------------------------------
-        # Cross-page continuation
+        # MCQ restart
         # ---------------------------------------------
-        if block2.page_number == block1.page_number + 1:
-
-            # Allow continuation
+        if re.search(
+            r"\(A\).+\(B\)",
+            text,
+            re.S
+        ):
             return True
 
         return False
 
     # =====================================================
-    # BUILD REGION OBJECT
+    # CONTINUATION SCORING
+    # =====================================================
+
+    def _continuation_score(
+        self,
+        region_blocks,
+        candidate_block,
+        anchor_type
+    ) -> float:
+
+        score = 0.0
+
+        candidate_layout = (
+            candidate_block
+            .ordered_block
+            .layout_block
+        )
+
+        candidate_type = (
+            candidate_block.semantic_type
+        )
+
+        # =================================================
+        # 1. Semantic compatibility
+        # =================================================
+
+        compatible = (
+            candidate_type
+            in self.region_compatibility.get(
+                anchor_type,
+                set()
+            )
+        )
+
+        if compatible:
+            score += 0.30
+
+        # =================================================
+        # 2. Spatial continuity
+        # =================================================
+
+        prev_layout = (
+            region_blocks[-1]
+            .ordered_block
+            .layout_block
+        )
+
+        spatial_score = self._spatial_score(
+            prev_layout,
+            candidate_layout
+        )
+
+        score += spatial_score * 0.25
+
+        # =================================================
+        # 3. Semantic similarity
+        # =================================================
+
+        semantic_score = self._semantic_similarity(
+            region_blocks,
+            candidate_layout.text
+        )
+
+        score += semantic_score * 0.30
+
+        # =================================================
+        # 4. Solution continuity signals
+        # =================================================
+
+        if anchor_type == "solution":
+
+            continuation_words = [
+
+                "therefore",
+
+                "hence",
+
+                "thus",
+
+                "given",
+
+                "substituting",
+
+                "we get",
+
+                "from equation",
+
+                "solving",
+            ]
+
+            lower = candidate_layout.text.lower()
+
+            hits = sum(
+                word in lower
+                for word in continuation_words
+            )
+
+            if hits > 0:
+                score += 0.15
+
+        return min(score, 1.0)
+
+    # =====================================================
+    # SPATIAL SCORE
+    # =====================================================
+
+    def _spatial_score(
+        self,
+        prev_block,
+        current_block
+    ) -> float:
+
+        # ---------------------------------------------
+        # Cross-page continuation
+        # ---------------------------------------------
+        if (
+            current_block.page_number
+            == prev_block.page_number + 1
+        ):
+            return 0.8
+
+        # ---------------------------------------------
+        # Large page jump
+        # ---------------------------------------------
+        if (
+            current_block.page_number
+            != prev_block.page_number
+        ):
+            return 0.0
+
+        # ---------------------------------------------
+        # Vertical gap
+        # ---------------------------------------------
+        gap = (
+            current_block.bbox[1]
+            - prev_block.bbox[3]
+        )
+
+        if gap < 0:
+            return 0.0
+
+        if gap <= self.max_vertical_gap:
+            return 1.0
+
+        if gap <= self.max_vertical_gap * 2:
+            return 0.5
+
+        return 0.0
+
+    # =====================================================
+    # SEMANTIC SIMILARITY
+    # =====================================================
+
+    def _semantic_similarity(
+        self,
+        region_blocks,
+        candidate_text
+    ) -> float:
+
+        existing_text = " ".join(
+
+            b.ordered_block.layout_block.text
+
+            for b in region_blocks[-5:]
+        )
+
+        words1 = set(
+            re.findall(
+                r"\w+",
+                existing_text.lower()
+            )
+        )
+
+        words2 = set(
+            re.findall(
+                r"\w+",
+                candidate_text.lower()
+            )
+        )
+
+        if not words1 or not words2:
+            return 0.0
+
+        overlap = len(
+            words1.intersection(words2)
+        )
+
+        union = len(
+            words1.union(words2)
+        )
+
+        return overlap / union
+
+    # =====================================================
+    # BUILD REGION
     # =====================================================
 
     def _build_region(
@@ -322,35 +547,54 @@ class SemanticRegionBuilder:
         if not classified_blocks:
 
             return SemanticRegion(
+
                 region_id=str(uuid.uuid4()),
+
                 region_type=anchor.anchor_type,
+
                 qid=anchor.qid,
+
                 page_start=anchor.page_number,
+
                 page_end=anchor.page_number,
+
                 blocks=[],
+
                 bbox=(0, 0, 0, 0),
+
                 text="",
-                confidence=0.0,
+
+                confidence=0.0
             )
 
         # ---------------------------------------------
-        # Aggregate blocks
+        # Layout blocks
         # ---------------------------------------------
         layout_blocks = [
+
             cb.ordered_block.layout_block
+
             for cb in classified_blocks
         ]
 
         # ---------------------------------------------
-        # Bounding box — only use blocks on page_start
-        # so cross-page blocks don't corrupt coordinates
+        # IMPORTANT:
+        # Merge ONLY same-page blocks for bbox
         # ---------------------------------------------
-        p_start = min(b.page_number for b in layout_blocks)
+        first_page = min(
+            b.page_number
+            for b in layout_blocks
+        )
+
         first_page_blocks = [
+
             b for b in layout_blocks
-            if b.page_number == p_start
+
+            if b.page_number == first_page
         ]
+
         bbox = self._merge_bboxes(
+
             [b.bbox for b in first_page_blocks]
         )
 
@@ -358,7 +602,9 @@ class SemanticRegionBuilder:
         # Combined text
         # ---------------------------------------------
         text = "\n".join(
+
             b.text
+
             for b in layout_blocks
         )
 
@@ -366,11 +612,15 @@ class SemanticRegionBuilder:
         # Confidence
         # ---------------------------------------------
         confidence = sum(
+
             cb.confidence
+
             for cb in classified_blocks
+
         ) / len(classified_blocks)
 
         return SemanticRegion(
+
             region_id=str(uuid.uuid4()),
 
             region_type=anchor.anchor_type,
@@ -426,7 +676,9 @@ class SemanticRegionBuilder:
         semantic_regions
     ):
 
-        print("\n========== SEMANTIC REGIONS ==========\n")
+        print(
+            "\n========== SEMANTIC REGIONS ==========\n"
+        )
 
         for region in semantic_regions:
 
@@ -438,6 +690,6 @@ class SemanticRegionBuilder:
                 f"Confidence={region.confidence:.2f}"
             )
 
-            print(region.text[:300])
+            print(region.text[:500])
 
             print("-" * 80)
